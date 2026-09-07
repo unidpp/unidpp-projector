@@ -13,7 +13,8 @@
 //!
 //! | endpoint | purpose |
 //! |---|---|
-//! | `GET /view?passport=<id>&profile=<profile-item>&actor=<role>[&at=<RFC3339>]` | the deterministic projection: profile block, selected elements, transformed values, coverage report, as-of, per-element trust markers |
+//! | `GET /view?passport=<id>&profile=<profile-item>&actor=<role>[&at=<RFC3339>]` | the deterministic projection: profile block, selected elements, transformed values (unit conversions, classifications, Primmel rules, aggregations, localization mappings), coverage report, as-of, per-element trust markers |
+//! | `GET /render?passport=<id>&profile=<profile-item>&lang=<tag>[&at=<RFC3339>]` | the consumer presentation (TODO.impl 54): the profile's data points arranged per its presentation binding — sections, localized labels, formatted values with units, links to sources, `render_metadata` (`template_ref`, `lang`, `formatting_rules`), coverage report |
 //! | `GET /` | service discovery (the endpoint contract) |
 //! | `GET /healthz` | liveness |
 //!
@@ -45,11 +46,15 @@ use tokio::net::TcpListener;
 use unidpp_cli::passport::Passport;
 use unidpp_model::{Resolution, Timestamp};
 
+use crate::aggregate::ChildDocuments;
+use crate::codelist::{CodeListMapping, MappingSet};
 use crate::fixtures;
 use crate::lens::LensManifest;
 use crate::primmel::PackageSet;
 use crate::project::{project, ProfileSource, RegisteredUnit};
 use crate::registry::{subregister, FetchOutcome, RegistryClient};
+use crate::render::render;
+use crate::twin;
 
 /// Deployment configuration (environment-driven; see `main.rs`).
 #[derive(Debug, Clone)]
@@ -139,6 +144,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/", get(discovery))
         .route("/healthz", get(healthz))
         .route("/view", get(view))
+        .route("/render", get(render_handler))
         .with_state(app)
 }
 
@@ -209,12 +215,13 @@ async fn discovery() -> Result<Response, Response> {
         "description": "UniDPP lens projection service: render a passport under a registered profile (view + coverage report) — the EU/JP two-lens moment as a service",
         "endpoints": {
             "view": "GET /view?passport=<passport-id>&profile=<profile-item>&actor=<role>[&at=<RFC3339>]",
+            "render": "GET /render?passport=<passport-id>&profile=<profile-item>&lang=<tag>[&at=<RFC3339>]",
             "health": "GET /healthz"
         },
         "view_contract": {
             "profile": {"id": "profile item id", "version": "manifest version pin", "axes": "...", "applies": "trigger + effective window at the as-of instant", "satisfiable": "capability floor vs subject", "source": "registry | fixtures | unreachable"},
             "selected": [{"element": "register/item@version", "value": "from the passport twin state", "sourced": {"seq": 0, "occurred_at": "...", "actor_role": "...", "actor_id": "..."}, "trust": "I9 marker of the sourcing event"}],
-            "transformed": [{"id": "...", "kind": "unit-conversion | classification | primmel", "input": "...", "output": "...", "trust": "marker of the input", "status": "computed | failed | missing-inputs"}],
+            "transformed": [{"id": "...", "kind": "unit-conversion | classification | primmel | aggregation | localization-mapping", "input": "...", "output": "...", "trust": "marker of the input", "status": "computed | failed | missing-inputs | missing-children | unmapped"}],
             "coverage": {"elements_required": 0, "elements_present": 0, "missing": [{"element": "...", "reason": "absent-as-of | below-trust-floor | capability-gate"}], "complete": false, "ratio": 1.0},
             "as_of": "the projection instant (?at= or now)",
             "trust": {"<element>": "<marker>", "…": "marker per selected element"}
@@ -222,9 +229,16 @@ async fn discovery() -> Result<Response, Response> {
         "selection_gates": ["capability-gate (subject class vs binding floor)", "presence (source fact on the twin state as-of)", "below-trust-floor (sourcing event marker vs binding floor)"],
         "sources": {
             "passports": "unidpp/passport@1 documents from UNIDPP_PROJECTOR_PASSPORTS_DIR, else the built-in two-lens fixture",
+            "children": "child passports of the traversal set (derived-issuance/combine inputs, replacements) from the same store or fixtures; aggregation transforms roll up over them and commit the input set's root hash",
             "profiles": "unidpp-registry profile items at UNIDPP_REGISTRY_URL (point-in-time with at=), else built-in EU/JP fixtures",
             "units": "registry units subregister identity (ISO 80000 citation chain); conversions are exact through the local ISO 80000 seed",
-            "primmel": ".prml rule packages from UNIDPP_PROJECTOR_PRIMMEL_DIR (operator pin), else the registry transform subregister, else built-in fixtures; each evaluated rule carries its clause_urn (the legal paragraph it implements)"
+            "primmel": ".prml rule packages from UNIDPP_PROJECTOR_PRIMMEL_DIR (operator pin), else the registry transform subregister, else built-in fixtures; each evaluated rule carries its clause_urn (the legal paragraph it implements)",
+            "mappings": "code-list mapping items (class transform) from the registry transform subregister, else built-in fixtures (EU A-E class <-> JP star display); unmapped values emit the explicit `unmapped` output"
+        },
+        "render_contract": {
+            "render_metadata": {"template_ref": "the presentation binding's template", "lang": "the requested language tag", "fallback_lang": "served when the requested language has no label", "formatting_rules": {"unit_position": "suffix | none", "decimal_digits": 1, "fallback_lang": "en"}, "as_of": "the render instant", "profile": {"id": "...", "version": "...", "source": "registry | fixtures | unreachable"}},
+            "sections": [{"id": "product | repair | recycling | ...", "label": "localized section title", "label_lang": "the language that served the label", "items": [{"element": "register/item@version", "label": "localized element label", "value": "exact value", "formatted": "display string with unit and digits", "source": {"view": "/view?..."} }]}],
+            "coverage": "the same coverage report shape as the view"
         },
         "as_of": {"query_parameter": "at", "response_header": "x-as-of"},
         "auth": "none (read-only service; the actor parameter is recorded, not authenticated)"
@@ -476,6 +490,81 @@ async fn resolve_packages(app: &AppState, lens: &LensManifest) -> Result<Package
     Ok(set)
 }
 
+/// Resolve the registered code-list mapping items the lens's
+/// localization bindings reference (TODO.impl 67), per item id: the
+/// registry's transform subregister when it serves the item (a *live*
+/// 404 leaves the binding unserved — the transform entry says the
+/// mapping is not available rather than inventing one), else the
+/// built-in fixtures (no registry configured, or one that is
+/// unreachable — the sourcing mode states which).
+async fn resolve_mappings(app: &AppState, lens: &LensManifest) -> Result<MappingSet, Response> {
+    let mut refs: Vec<String> = Vec::new();
+    for transform in &lens.transforms {
+        for r in transform.mapping_refs() {
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+        }
+    }
+    if refs.is_empty() {
+        return Ok(MappingSet::empty());
+    }
+    let fallback = fixtures::fixture_mappings();
+    let mut set = MappingSet::empty();
+    for r in refs {
+        match app
+            .registry
+            .fetch_item(subregister::TRANSFORMS, &r, None)
+            .await
+        {
+            Ok(FetchOutcome::Registry(doc)) => {
+                let mapping = CodeListMapping::from_item(&doc)
+                    .map_err(|e| bad_gateway(&format!("code-list mapping item `{r}`: {e}")))?;
+                set.insert(mapping, "registry");
+            }
+            Ok(FetchOutcome::Missing) => {
+                // A live negative stands: the binding will report the
+                // mapping as unavailable.
+            }
+            Ok(FetchOutcome::Fixtures) | Ok(FetchOutcome::Unreachable(_)) => {
+                if let Some((mapping, _)) = fallback.get(&r) {
+                    set.insert(mapping.clone(), "fixtures");
+                }
+            }
+            Err(e) => {
+                return Err(bad_gateway(&format!(
+                    "registry read of code-list mapping `{r}` failed: {e}"
+                )))
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// The child passport documents of the subject's active traversal set
+/// as-of the instant (aggregation inputs). Store mode resolves each
+/// active child id from the configured directory; fixture mode serves
+/// the built-in pack corpus. A child whose document cannot be
+/// resolved is *not* an error here — the aggregation entry reports it
+/// as a per-child gap.
+fn load_children(dir: Option<&Path>, subject: &Passport, at: Timestamp) -> ChildDocuments {
+    let ids = twin::fold(subject, at).children;
+    if ids.is_empty() {
+        return ChildDocuments::empty();
+    }
+    let mut documents = Vec::new();
+    for id in ids {
+        let found = match dir {
+            Some(dir) => load_passport(Some(dir), &id).ok().map(|(p, _)| p),
+            None => fixtures::fixture_child(&id),
+        };
+        if let Some(p) = found {
+            documents.push(p);
+        }
+    }
+    ChildDocuments::of(documents)
+}
+
 /// GET /view — the projection.
 async fn view(
     State(app): State<Arc<AppState>>,
@@ -511,7 +600,13 @@ async fn view(
     // 4. Primmel packages for the rule bindings.
     let packages = resolve_packages(&app, &resolved.lens).await?;
 
-    // 5. Project.
+    // 5. Code-list mappings for the localization bindings.
+    let mappings = resolve_mappings(&app, &resolved.lens).await?;
+
+    // 6. Child documents of the traversal set (aggregation inputs).
+    let children = load_children(app.config.passports_dir.as_deref(), &passport, as_of);
+
+    // 7. Project.
     let mut doc = project(
         &passport,
         &resolved.lens,
@@ -520,6 +615,99 @@ async fn view(
         &units,
         &resolved.source,
         &packages,
+        &mappings,
+        &children,
+    )
+    .map_err(|e| internal_error(&e.to_string()))?;
+    if let Some(block) = doc.pointer_mut("/passport").and_then(Value::as_object_mut) {
+        block.insert("source".into(), json!(passport_source));
+    }
+    Ok(stamped(StatusCode::OK, &doc, as_of))
+}
+
+/// The parsed `GET /render` query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderQuery {
+    pub passport: String,
+    pub profile: String,
+    pub lang: String,
+    pub at: Option<Timestamp>,
+}
+
+/// Parse and validate the render query (pure; unit-tested). `lang` is
+/// required — the render is per-language by definition; an unknown
+/// tag is not an error (the missing-label fallback serves what the
+/// binding declares, and the metadata states both).
+fn parse_render_query(params: &HashMap<String, String>) -> Result<RenderQuery, Response> {
+    let required = |key: &str| -> Result<String, Response> {
+        params
+            .get(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad_request(format!("`{key}` query parameter is required")))
+    };
+    let at = match params.get("at").map(|s| s.trim()) {
+        None | Some("") => None,
+        Some(raw) => Some(
+            Timestamp::parse(raw)
+                .map_err(|e| bad_request(format!("invalid `at` parameter: {e}")))?,
+        ),
+    };
+    Ok(RenderQuery {
+        passport: required("passport")?,
+        profile: required("profile")?,
+        lang: required("lang")?,
+        at,
+    })
+}
+
+/// GET /render — the consumer presentation (TODO.impl 54): the
+/// passport's data points arranged per the lens's presentation
+/// binding, localized, formatted, with links to the authoritative
+/// sources and the same coverage honesty as the view.
+async fn render_handler(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, Response> {
+    let query = parse_render_query(&params)?;
+    let as_of = query.at.unwrap_or_else(Timestamp::now);
+
+    // 1. The passport document (store, else the built-in fixture).
+    let (passport, passport_source) =
+        load_passport(app.config.passports_dir.as_deref(), &query.passport).map_err(
+            |e| match e {
+                LoadError::NotFound(id) => not_found(&format!("no passport `{id}`")),
+                LoadError::Corrupt(file, why) => internal_error(&format!(
+                    "corrupt passport document `{}`: {why}",
+                    file.display()
+                )),
+            },
+        )?;
+
+    // 2. The lens manifest (registry, else fixtures) — it must carry a
+    //    presentation binding.
+    let resolved = resolve_lens(&app, &query.profile, query.at).await?;
+    if resolved.lens.profile.resolution == Resolution::None {
+        return Err(forbidden(&format!(
+            "profile `{}` is not servable (resolution `none`)",
+            query.profile
+        )));
+    }
+    if resolved.lens.presentation.is_none() {
+        return Err(bad_request(format!(
+            "profile `{}` carries no presentation binding — `/render` needs \
+             one; `/view` serves this profile",
+            query.profile
+        )));
+    }
+
+    // 3. Render.
+    let mut doc = render(
+        &passport,
+        &resolved.lens,
+        as_of,
+        &query.lang,
+        &resolved.source,
     )
     .map_err(|e| internal_error(&e.to_string()))?;
     if let Some(block) = doc.pointer_mut("/passport").and_then(Value::as_object_mut) {
@@ -699,6 +887,89 @@ mod tests {
     }
 
     #[test]
+    fn render_query_requires_lang_and_parses_at() {
+        // lang is required — the render is per-language by definition.
+        let err = parse_render_query(&params(&[
+            ("passport", "p"),
+            ("profile", "l"),
+            ("lang", " "),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        let err = parse_render_query(&params(&[("passport", "p"), ("profile", "l")])).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        let ok = parse_render_query(&params(&[
+            ("passport", " p "),
+            ("profile", "l"),
+            ("lang", " ja "),
+            ("at", "2027-02-11T11:00:00Z"),
+        ]))
+        .unwrap();
+        assert_eq!(ok.passport, "p");
+        assert_eq!(ok.lang, "ja");
+        assert_eq!(ok.at, Some(demo_as_of()));
+
+        let err = parse_render_query(&params(&[
+            ("passport", "p"),
+            ("profile", "l"),
+            ("lang", "ja"),
+            ("at", "soon"),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn children_load_from_fixtures_and_the_store() {
+        let system = crate::fixtures::pack_system();
+        let at = demo_as_of();
+        // Fixture mode: the pack system's three children resolve; the
+        // laptop (whose child edge names a sodimm with no fixture
+        // document) resolves nothing — the aggregation would report
+        // the gap.
+        let children = load_children(None, &system, at);
+        assert_eq!(children.documents.len(), 3);
+        assert!(children.get(crate::fixtures::PACK_CHILD_IDS[0]).is_some());
+        let laptop = crate::fixtures::demo_passport();
+        let laptop_children = load_children(None, &laptop, at);
+        assert_eq!(laptop_children.documents.len(), 0);
+
+        // Store mode: the children load from the directory.
+        let dir = std::env::temp_dir().join(format!(
+            "unidpp-projector-test-children-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, child) in crate::fixtures::pack_children().into_iter().enumerate() {
+            std::fs::write(dir.join(format!("pack-{i}.json")), child.to_json().unwrap()).unwrap();
+        }
+        let children = load_children(Some(&dir), &system, at);
+        assert_eq!(children.documents.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mapping_resolution_without_a_registry_uses_fixtures() {
+        // No registry configured: the built-in fixtures serve and say
+        // so; a lens without localization bindings resolves nothing.
+        let app = AppState::new(Config::default());
+        let set = resolve_mappings(&app, &crate::fixtures::pack_lens())
+            .await
+            .unwrap();
+        let (mapping, source) = set.get(crate::fixtures::EU_CLASS_TO_JP_STAR_ID).unwrap();
+        assert_eq!(source, "fixtures");
+        assert_eq!(mapping.version, "1.0.0");
+        assert_eq!(
+            resolve_mappings(&app, &crate::fixtures::eu_lens())
+                .await
+                .unwrap(),
+            MappingSet::empty()
+        );
+    }
+
+    #[test]
     fn fixture_mode_loads_only_the_demo_passport() {
         let (passport, source) = load_passport(None, DEMO_PASSPORT_ID).unwrap();
         assert_eq!(source, "fixture");
@@ -793,6 +1064,8 @@ mod tests {
             &units,
             &source,
             &packages,
+            &MappingSet::empty(),
+            &ChildDocuments::empty(),
         )
         .unwrap();
         let jp = project(
@@ -803,6 +1076,8 @@ mod tests {
             &units,
             &source,
             &packages,
+            &MappingSet::empty(),
+            &ChildDocuments::empty(),
         )
         .unwrap();
 

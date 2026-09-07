@@ -16,13 +16,17 @@
 //! | `RefurbishRemanufacture` | fact `subject.condition-grade` := grade |
 //! | `ProductModify` | fact `subject.type` := derived type (when one spawns) |
 //! | `StatusChange` | status tracked |
+//! | `Issuance` (derived), `Combine` | child edges += inputs (the |
+//! | | traversal set is born) |
+//! | `PartReplace`, `ConsumableReplace` | child edges: - removed, + added |
+//! | `RepairPerform` | child edges - consumed parts |
 //!
 //! Later events overwrite earlier same-path facts (append-only log,
 //! last write wins as-of); the origin (sequence, time, actor role and
 //! id, trust marker) travels with the value so the projection can
 //! state *who measured what and under which trust marker*.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use unidpp_cli::passport::Passport;
 use unidpp_event::{EventPayload, Status};
@@ -72,6 +76,11 @@ pub struct TwinState {
     pub status: Status,
     /// Current custodian as-of, when a custody transfer is recorded.
     pub custodian: Option<String>,
+    /// The active child set as-of (the traversal set: derived-issuance
+    /// and combine inputs, plus parts added by replacements, minus
+    /// parts removed or consumed — I5 typed edges replayed). Passport
+    /// ids, sorted.
+    pub children: BTreeSet<String>,
     /// Events counted into this state (the as-of prefix length).
     pub event_count: usize,
     /// When the last counted event occurred.
@@ -105,6 +114,7 @@ pub fn fold(passport: &Passport, at: Timestamp) -> TwinState {
         facts: BTreeMap::new(),
         status: Status::Issued,
         custodian: None,
+        children: BTreeSet::new(),
         event_count: 0,
         last_event_at: None,
     };
@@ -112,9 +122,13 @@ pub fn fold(passport: &Passport, at: Timestamp) -> TwinState {
         let event = &sealed.event;
         let origin = FactOrigin::of(event.seq, event);
         match &event.payload {
-            EventPayload::Issuance { .. } => {
+            EventPayload::Issuance { inputs, .. } => {
                 // Identity is never re-minted; the skeleton already
-                // carries it. Nothing to fold.
+                // carries it. A *derived* issuance names its input
+                // passports — the traversal set is born.
+                for input in inputs {
+                    state.children.insert(input.input.as_str().to_string());
+                }
             }
             EventPayload::MilestoneRecord { counters } => {
                 for (k, v) in counters {
@@ -185,6 +199,21 @@ pub fn fold(passport: &Passport, at: Timestamp) -> TwinState {
             EventPayload::StatusChange { to, .. } => {
                 state.status = *to;
             }
+            EventPayload::Combine { inputs, .. } => {
+                for input in inputs {
+                    state.children.insert(input.input.as_str().to_string());
+                }
+            }
+            EventPayload::PartReplace { removed, added, .. }
+            | EventPayload::ConsumableReplace { removed, added } => {
+                state.children.remove(removed.as_str());
+                state.children.insert(added.as_str().to_string());
+            }
+            EventPayload::RepairPerform { consumed_parts, .. } => {
+                for part in consumed_parts {
+                    state.children.remove(part.as_str());
+                }
+            }
             EventPayload::Split {
                 parent_consumed, ..
             } => {
@@ -199,8 +228,8 @@ pub fn fold(passport: &Passport, at: Timestamp) -> TwinState {
                 state.status = Status::EndOfWaste;
             }
             _ => {
-                // Structural events (install edges, replacements,
-                // recalls, flags, stamps) do not write scalar facts;
+                // Structural events (install edges, recalls, flags,
+                // stamps) do not write scalar facts or child edges;
                 // the view reports the log separately.
             }
         }
@@ -328,6 +357,15 @@ mod tests {
         );
         assert_eq!(state.status, Status::Issued);
         assert_eq!(state.event_count, 8);
+        // The laptop's part replacement: the added sodimm is an active
+        // child as-of the demo instant, the removed one is not.
+        assert_eq!(
+            state.children,
+            ["urn:unidpp:passport:sodimm-32g-aa119-0007"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
     }
 
     #[test]

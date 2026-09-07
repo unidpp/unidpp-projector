@@ -24,7 +24,12 @@
 //! than what it was computed from. Primmel decision-rule transforms
 //! (TODO.impl C9) evaluate their package's rule deterministically over
 //! the bound twin facts and carry the rule's `clause_urn` — the legal
-//! paragraph the decision implements — in the output.
+//! paragraph the decision implements — in the output. Aggregation
+//! transforms (TODO.impl 66) roll the input element up over the
+//! subject's active child set, citing the method standard; code-list
+//! mapping transforms (TODO.impl 67) translate a code value through a
+//! registered correspondence item, emitting `unmapped` for values the
+//! table does not carry.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,6 +40,8 @@ use unidpp_model::{CapabilityClass, Decimal, FactValue, Timestamp, TrustMarker};
 use unidpp_transform::quantity::{Quantity, UnitRegistry};
 use unidpp_verdict::CoverageReport;
 
+use crate::aggregate::{aggregation_json, ChildDocuments};
+use crate::codelist::{MappingSet, UNMAPPED};
 use crate::lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
 use crate::primmel::{EvalError, PackageSet};
 use crate::twin::{self, SourcedFact};
@@ -53,7 +60,9 @@ pub enum MissingReason {
 }
 
 impl MissingReason {
-    fn detail(&self) -> String {
+    /// The human phrasing of the reason (shared by the view and the
+    /// presentation render).
+    pub(crate) fn detail(&self) -> String {
         match self {
             MissingReason::AbsentAsOf => {
                 "no event wrote this fact at or before the as-of instant".to_string()
@@ -128,7 +137,12 @@ impl std::error::Error for ViewError {}
 /// registry unit item ids to their resolved identities (absent when
 /// the registry could not serve them); `source` reports where the
 /// manifest came from; `packages` holds the Primmel packages the
-/// lens's rule bindings may consult (empty when the lens has none).
+/// lens's rule bindings may consult (empty when the lens has none);
+/// `mappings` holds the registered code-list mapping items the lens's
+/// localization bindings reference; `children` holds the child
+/// passport documents of the traversal set (empty when the subject
+/// has no aggregation bindings or no resolvable children).
+#[allow(clippy::too_many_arguments)]
 pub fn project(
     passport: &Passport,
     lens: &LensManifest,
@@ -137,6 +151,8 @@ pub fn project(
     units: &BTreeMap<String, RegisteredUnit>,
     source: &ProfileSource,
     packages: &PackageSet,
+    mappings: &MappingSet,
+    children: &ChildDocuments,
 ) -> Result<Value, ViewError> {
     lens.validate().map_err(ViewError::Invalid)?;
     let state = twin::fold(passport, at);
@@ -171,10 +187,13 @@ pub fn project(
         transformed.push(transform_json(
             binding,
             &state,
+            lens,
             &unit_registry,
             units,
             at,
             packages,
+            mappings,
+            children,
         ));
     }
 
@@ -271,13 +290,14 @@ pub fn project(
     Ok(Value::Object(view))
 }
 
-/// The outcome of evaluating one binding.
-enum Selection<'a> {
+/// The outcome of evaluating one binding (shared with the
+/// presentation render — one selection model, two surfaces).
+pub(crate) enum Selection<'a> {
     Found(&'a SourcedFact),
     Blocked(MissingReason),
 }
 
-fn select<'a>(
+pub(crate) fn select<'a>(
     passport: &Passport,
     state: &'a twin::TwinState,
     binding: &DataPointBinding,
@@ -323,8 +343,9 @@ fn selected_json(element: &str, binding: &DataPointBinding, fact: &SourcedFact) 
 }
 
 /// A fact value as plain JSON: decimals stay exact strings, booleans
-/// and lists are native, strings are strings.
-fn fact_value_json(value: &FactValue) -> Value {
+/// and lists are native, strings are strings (shared with the
+/// presentation render).
+pub(crate) fn fact_value_json(value: &FactValue) -> Value {
     match value {
         FactValue::Str(s) => json!(s),
         FactValue::Num(d) => json!(d.to_string()),
@@ -333,13 +354,17 @@ fn fact_value_json(value: &FactValue) -> Value {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transform_json(
     binding: &TransformBinding,
     state: &twin::TwinState,
+    lens: &LensManifest,
     unit_registry: &UnitRegistry,
     units: &BTreeMap<String, RegisteredUnit>,
     at: Timestamp,
     packages: &PackageSet,
+    mappings: &MappingSet,
+    children: &ChildDocuments,
 ) -> Value {
     let mut m = Map::new();
     m.insert("id".into(), json!(binding.id()));
@@ -347,8 +372,56 @@ fn transform_json(
         TransformBinding::UnitConversion { .. } => "unit-conversion",
         TransformBinding::Classification { .. } => "classification",
         TransformBinding::Primmel { .. } => "primmel",
+        TransformBinding::Aggregation { .. } => "aggregation",
+        TransformBinding::LocalizationMapping { .. } => "localization-mapping",
     };
     m.insert("kind".into(), json!(kind));
+    // Aggregation entries render their own source line (the input
+    // element fanned out over children) and evaluate through the
+    // aggregate module.
+    if let TransformBinding::Aggregation {
+        operation,
+        input_element,
+        weight_element,
+        method_citation,
+        ..
+    } = binding
+    {
+        // Unreachable after validate(): the element is a data point
+        // and every data point is bound — but the engine still states
+        // the gap rather than panicking.
+        let (input_binding, weight_binding) = match (
+            lens.binding_for(input_element),
+            weight_element.as_deref().and_then(|w| lens.binding_for(w)),
+        ) {
+            (Some(i), w) => (i, w),
+            (None, _) => {
+                let mut failed = Map::new();
+                failed.insert("id".into(), json!(binding.id()));
+                failed.insert("kind".into(), json!("aggregation"));
+                failed.insert("status".into(), json!("failed"));
+                failed.insert(
+                    "error".into(),
+                    json!(format!(
+                        "aggregation `{}` input element `{input_element}` \
+                         has no binding",
+                        binding.id()
+                    )),
+                );
+                return Value::Object(failed);
+            }
+        };
+        return aggregation_json(
+            binding.id(),
+            *operation,
+            input_binding,
+            weight_binding,
+            method_citation,
+            state,
+            children,
+            at,
+        );
+    }
     m.insert("source".into(), json!(binding.source()));
     if let TransformBinding::Primmel {
         package_ref,
@@ -367,6 +440,19 @@ fn transform_json(
         let paths: Vec<&str> = inputs.values().map(String::as_str).collect();
         m.insert("source".into(), json!(paths.join(",")));
         let entry = primmel_json(package_ref, rule_id, inputs, state, packages, at);
+        if let Value::Object(fields) = entry {
+            for (k, v) in fields {
+                m.insert(k, v);
+            }
+        }
+        return Value::Object(m);
+    }
+    if let TransformBinding::LocalizationMapping { mapping_ref, .. } = binding {
+        // Localization mappings own their JSON shape: the mapped
+        // output (or the explicit `unmapped`), the mapping item's
+        // identity and citation. (The generic input/trust fields below
+        // are covered by the block this branch emits.)
+        let entry = mapping_json(mapping_ref, binding.source(), state, mappings, at);
         if let Value::Object(fields) = entry {
             for (k, v) in fields {
                 m.insert(k, v);
@@ -414,8 +500,12 @@ fn transform_json(
                 _ => None,
             })
         }
-        // Primmel bindings render their own entry (early return above).
-        TransformBinding::Primmel { .. } => None,
+        // Primmel and localization-mapping bindings render their own
+        // entries (early returns above); aggregation evaluates in the
+        // aggregate module (early return above).
+        TransformBinding::Primmel { .. }
+        | TransformBinding::Aggregation { .. }
+        | TransformBinding::LocalizationMapping { .. } => None,
     };
     // The input travels with the transform whatever happens (so a
     // failed transform still states what it was asked to compute).
@@ -447,6 +537,12 @@ fn transform_json(
                         "classification source is not a numeric fact".to_string()
                     }
                     TransformBinding::Primmel { .. } => "primmel rule could not run".to_string(),
+                    // Unreachable: aggregation and localization
+                    // mappings early-return their own entries.
+                    TransformBinding::Aggregation { .. } => "aggregation could not run".to_string(),
+                    TransformBinding::LocalizationMapping { .. } => {
+                        "localization mapping could not run".to_string()
+                    }
                 }
             };
             m.insert("status".into(), json!("failed"));
@@ -610,6 +706,99 @@ fn primmel_json(
     Value::Object(m)
 }
 
+/// Evaluate one localization-mapping binding and render its transform
+/// entry (TODO.impl 67): the input code value, the mapping item's
+/// identity/version/schemes/citation and sourcing mode, and the target
+/// value — or the explicit [`UNMAPPED`] output when the table carries
+/// no correspondence for the input. Honesty doctrine: a missing fact
+/// as-of or an unavailable mapping item is a failure with its reason;
+/// a *present but unmapped* value is the `unmapped` output, never a
+/// silent pass-through.
+fn mapping_json(
+    mapping_ref: &str,
+    source: &str,
+    state: &twin::TwinState,
+    mappings: &MappingSet,
+    at: Timestamp,
+) -> Value {
+    let mut m = Map::new();
+    let input = state.get(source);
+    let Some(fact) = input else {
+        m.insert("status".into(), json!("failed"));
+        m.insert(
+            "error".into(),
+            json!(format!("source fact `{source}` is absent as-of {at}")),
+        );
+        return Value::Object(m);
+    };
+    m.insert("input".into(), fact_value_json(&fact.value));
+    m.insert("trust".into(), json!(fact.origin.trust.to_string()));
+    // Code values are strings (or numeric codes, looked up by their
+    // exact decimal spelling).
+    let code = match &fact.value {
+        FactValue::Str(s) => s.clone(),
+        FactValue::Num(n) => n.to_string(),
+        other => {
+            m.insert("status".into(), json!("failed"));
+            m.insert(
+                "error".into(),
+                json!(format!(
+                    "mapping source `{source}` is a {} fact; the table \
+                     keys on code values",
+                    other.type_name()
+                )),
+            );
+            return Value::Object(m);
+        }
+    };
+    let Some((mapping, mapping_source)) = mappings.get(mapping_ref) else {
+        m.insert("status".into(), json!("failed"));
+        m.insert(
+            "error".into(),
+            json!(format!(
+                "code-list mapping item `{mapping_ref}` is not available \
+                 to this projector"
+            )),
+        );
+        return Value::Object(m);
+    };
+    let mut block = Map::new();
+    block.insert("id".into(), json!(mapping.id));
+    block.insert("version".into(), json!(mapping.version));
+    block.insert("source".into(), json!(mapping_source));
+    block.insert("source_scheme".into(), json!(mapping.source_scheme));
+    block.insert("target_scheme".into(), json!(mapping.target_scheme));
+    if let Some(c) = &mapping.citation {
+        block.insert("citation".into(), json!(c));
+    }
+    block.insert("entries".into(), json!(mapping.table.len()));
+    m.insert("mapping".into(), Value::Object(block));
+    match mapping.lookup(&code) {
+        Some(entry) => {
+            m.insert("output".into(), json!(entry.target_value));
+            if let Some(note) = &entry.note {
+                m.insert("note".into(), json!(note));
+            }
+            m.insert("status".into(), json!("computed"));
+        }
+        None => {
+            // A value the registered table does not carry: explicit,
+            // never a silent pass of the source value.
+            m.insert("output".into(), json!(UNMAPPED));
+            m.insert(
+                "detail".into(),
+                json!(format!(
+                    "value `{code}` of {} has no correspondence in `{}` \
+                     ({} -> {})",
+                    mapping.source_scheme, mapping.id, mapping.source_scheme, mapping.target_scheme
+                )),
+            );
+            m.insert("status".into(), json!(UNMAPPED));
+        }
+    }
+    Value::Object(m)
+}
+
 /// The exact conversion and the resolved unit identities. `None` when
 /// the source is not a numeric fact in a registered unit — the caller
 /// reports the failure with its reason.
@@ -672,6 +861,7 @@ fn unit_identity_json(item: &Option<String>, units: &BTreeMap<String, Registered
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregate::AggregationOperation;
     use crate::lens::{ClassBand, DataPointBinding};
     use unidpp_event::{EventLog, EventPayload, TypedEvent};
     use unidpp_model::{
@@ -771,6 +961,7 @@ mod tests {
             },
             bindings,
             transforms,
+            presentation: None,
         };
         lens
     }
@@ -810,6 +1001,8 @@ mod tests {
             &BTreeMap::new(),
             &ProfileSource::registry(),
             packages,
+            &MappingSet::empty(),
+            &ChildDocuments::empty(),
         )
         .unwrap()
     }
@@ -1269,6 +1462,441 @@ mod tests {
         assert_eq!(selected[1]["value"], json!("a,b"));
     }
 
+    // --- aggregation (TODO.impl 66) -------------------------------------
+
+    /// The pack roll-up scenario: the fixture pack system over its
+    /// three children, rendered through the fixture lens.
+    fn pack_view() -> Value {
+        let children = ChildDocuments::of(crate::fixtures::pack_children());
+        project(
+            &crate::fixtures::pack_system(),
+            &crate::fixtures::pack_lens(),
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &MappingSet::empty(),
+            &children,
+        )
+        .unwrap()
+    }
+
+    fn pack_transform<'a>(view: &'a Value, id: &str) -> &'a Value {
+        view["transformed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"].as_str() == Some(id))
+            .unwrap_or(&Value::Null)
+    }
+
+    #[test]
+    fn aggregation_sum_over_three_children_with_method_citation() {
+        let view = pack_view();
+        let rollup = pack_transform(&view, "carbon-rollup");
+        assert_eq!(rollup["kind"], json!("aggregation"));
+        assert_eq!(rollup["operation"], json!("sum"));
+        assert_eq!(rollup["method_citation"], json!("ISO 14067:2018"));
+        assert_eq!(rollup["status"], json!("computed"));
+        // 31.5 + 33.0 + 25.5 = 90 kgCO2e exactly.
+        assert_eq!(rollup["output"], json!({"amount": "90", "unit": "kgCO2e"}));
+        assert_eq!(rollup["children_required"], json!(3));
+        assert_eq!(rollup["children_provided"], json!(3));
+        // The committed input set's root hash travels with the output.
+        assert_eq!(rollup["input_set_root"].as_str().unwrap().len(), 64);
+        // Every input states its passport, value, trust and log head.
+        let inputs = rollup["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0]["value"], json!("31.5"));
+        assert_eq!(inputs[0]["trust"], json!("attested"));
+        assert!(inputs[0]["log_head"].as_str().unwrap().len() >= 16);
+        // The roll-up inherits the weakest input trust.
+        assert_eq!(rollup["trust"], json!("attested"));
+    }
+
+    #[test]
+    fn aggregation_weighted_average_is_exact() {
+        let view = pack_view();
+        let average = pack_transform(&view, "soh-weighted-average");
+        assert_eq!(average["operation"], json!("weighted-average"));
+        assert_eq!(average["method_citation"], json!("IEC 62660-1:2018"));
+        // (91.2*12.5 + 88.4*15.5 + 86.9*12.0) / (12.5+15.5+12.0)
+        // = 3553 / 40 = 88.825 exactly.
+        assert_eq!(average["output"], json!({"amount": "88.825", "unit": "%"}));
+        assert_eq!(
+            average["weight_element"],
+            json!("ferin:eu/pack.mass-kg@1.0.0")
+        );
+        assert_eq!(average["status"], json!("computed"));
+    }
+
+    #[test]
+    fn aggregation_count_counts_the_providing_children() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::Aggregation {
+                id: "count".into(),
+                operation: AggregationOperation::Count,
+                input_element: "ferin:eu/score@1".into(),
+                weight_element: None,
+                method_citation: "ISO 14067:2018".into(),
+            }],
+        );
+        // Build a subject over two children providing `score`, and one
+        // that does not: the count is 2, the missing child a gap.
+        let mut children: Vec<Passport> = Vec::new();
+        for (i, provides) in [(0, true), (1, true), (2, false)] {
+            let mut child = passport_with(
+                CapabilityClass::PassiveAuth,
+                vec![event(
+                    0,
+                    EventPayload::MilestoneRecord {
+                        counters: if provides {
+                            [("score".to_string(), "1".parse().unwrap())]
+                                .into_iter()
+                                .collect()
+                        } else {
+                            BTreeMap::new()
+                        },
+                    },
+                    TrustMarker::Attested,
+                )],
+            );
+            child.passport_id = PassportId::new(&format!("urn:unidpp:passport:child-{i}")).unwrap();
+            children.push(child);
+        }
+        let mut subject = rich_passport();
+        subject.passport_id = PassportId::new("urn:unidpp:passport:parent").unwrap();
+        let inputs: Vec<unidpp_transform::InputReference> = children
+            .iter()
+            .map(|c| unidpp_transform::InputReference {
+                input: c.passport_id.clone(),
+                quantity: unidpp_transform::Quantity::new(
+                    Decimal::one(),
+                    unidpp_transform::quantity::Unit::new("kg", "urn:iso:std:iso:80000-4").unwrap(),
+                ),
+                as_of_state_hash: c.log.state_hash_at(at()).expect("child state hash exists"),
+            })
+            .collect();
+        subject.log = {
+            let mut log = EventLog::new(subject.passport_id.clone());
+            log.append(
+                TypedEvent::new(
+                    0,
+                    Timestamp::from_secs(1_600_000_000),
+                    "issuing authority",
+                    "urn:unidpp:actor:test",
+                    unidpp_event::EventType::Issuance,
+                    EventPayload::Issuance {
+                        derived: true,
+                        inputs,
+                    },
+                    TrustMarker::Attested,
+                )
+                .unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+            log
+        };
+        let view = project(
+            &subject,
+            &lens,
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &MappingSet::empty(),
+            &ChildDocuments::of(children),
+        )
+        .unwrap();
+        let count = &view["transformed"][0];
+        assert_eq!(count["status"], json!("missing-children"));
+        assert_eq!(count["output"]["amount"], json!("2"));
+        let missing = count["missing_children"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0]["passport"], json!("urn:unidpp:passport:child-2"));
+        assert_eq!(missing[0]["reason"], json!("absent-as-of"));
+    }
+
+    #[test]
+    fn aggregation_missing_child_is_a_coverage_gap_not_an_error() {
+        // Drop one child document: the roll-up computes over the two
+        // provided children and reports the third as a gap — the
+        // method citation and committed set root still travel.
+        let all = crate::fixtures::pack_children();
+        let two: Vec<Passport> = all.into_iter().take(2).collect();
+        let children = ChildDocuments::of(two);
+        let view = project(
+            &crate::fixtures::pack_system(),
+            &crate::fixtures::pack_lens(),
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &MappingSet::empty(),
+            &children,
+        )
+        .unwrap();
+        let rollup = pack_transform(&view, "carbon-rollup");
+        assert_eq!(rollup["status"], json!("missing-children"));
+        // 31.5 + 33.0 over the two provided children.
+        assert_eq!(rollup["output"]["amount"], json!("64.5"));
+        let missing = rollup["missing_children"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0]["passport"],
+            json!(crate::fixtures::PACK_CHILD_IDS[2])
+        );
+        assert_eq!(missing[0]["reason"], json!("document-unavailable"));
+        assert_eq!(rollup["method_citation"], json!("ISO 14067:2018"));
+    }
+
+    #[test]
+    fn aggregation_without_a_traversal_set_fails_visibly() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::Aggregation {
+                id: "rollup".into(),
+                operation: AggregationOperation::Sum,
+                input_element: "ferin:eu/score@1".into(),
+                weight_element: None,
+                method_citation: "ISO 14067:2018".into(),
+            }],
+        );
+        // The rich passport's part replacement gives it one active
+        // child edge... whose document does not resolve here; fold the
+        // log to check the actual traversal set semantics instead: a
+        // passport with no edges at all.
+        let mut subject = rich_passport();
+        subject.log = EventLog::new(subject.passport_id.clone());
+        let view = project(
+            &subject,
+            &lens,
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &MappingSet::empty(),
+            &ChildDocuments::empty(),
+        )
+        .unwrap();
+        let rollup = &view["transformed"][0];
+        assert_eq!(rollup["status"], json!("failed"));
+        let error = rollup["error"].as_str().unwrap();
+        assert!(
+            error.contains("no active child edges") && error.contains("traversal set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn aggregation_is_deterministic() {
+        assert_eq!(pack_view(), pack_view());
+    }
+
+    // --- localization mapping (TODO.impl 67) ----------------------------
+
+    #[test]
+    fn localization_mapping_translates_the_code_value() {
+        let mappings = crate::fixtures::fixture_mappings();
+        let view = pack_view_with_mappings(&mappings);
+        let stars = pack_transform(&view, "jp-star-display");
+        assert_eq!(stars["kind"], json!("localization-mapping"));
+        assert_eq!(stars["status"], json!("computed"));
+        assert_eq!(stars["input"], json!("B"));
+        assert_eq!(stars["output"], json!("★★★★"));
+        assert_eq!(stars["trust"], json!("attested"));
+        // The registered item's identity, version, schemes and
+        // citation travel with the mapped value.
+        let mapping = &stars["mapping"];
+        assert_eq!(
+            mapping["id"],
+            json!(crate::fixtures::EU_CLASS_TO_JP_STAR_ID)
+        );
+        assert_eq!(mapping["version"], json!("1.0.0"));
+        assert_eq!(mapping["source"], json!("fixtures"));
+        assert_eq!(
+            mapping["source_scheme"],
+            json!("urn:eu:reg:2017:1369#annex-ii-class")
+        );
+        assert_eq!(mapping["target_scheme"], json!("urn:jp:meti:star-rating"));
+        assert_eq!(mapping["entries"], json!(5));
+        assert!(mapping["citation"].as_str().unwrap().contains("2017/1369"));
+    }
+
+    #[test]
+    fn localization_mapping_of_an_unmapped_value_is_explicit() {
+        // The subject's class is changed to one outside the registered
+        // table: the output is the explicit `unmapped`, never a silent
+        // pass of the source value.
+        let mut system = crate::fixtures::pack_system();
+        let mut log = system.log.clone();
+        log.append(
+            TypedEvent::new(
+                system.log.len() as u64,
+                at(),
+                "economic operator",
+                "urn:unidpp:actor:oem-batteriewerke",
+                unidpp_event::EventType::Correction,
+                EventPayload::Correction {
+                    field: crate::fixtures::facts::ENERGY_LABEL.to_string(),
+                    prior_value: "B".into(),
+                    new_value: "G".into(),
+                    reason: "re-graded to the bottom class".into(),
+                },
+                TrustMarker::Attested,
+            )
+            .unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        system.log = log;
+        let mappings = crate::fixtures::fixture_mappings();
+        let view = project(
+            &system,
+            &crate::fixtures::pack_lens(),
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &mappings,
+            &ChildDocuments::of(crate::fixtures::pack_children()),
+        )
+        .unwrap();
+        let stars = pack_transform(&view, "jp-star-display");
+        assert_eq!(stars["status"], json!("unmapped"));
+        assert_eq!(stars["output"], json!("unmapped"));
+        assert_eq!(stars["input"], json!("G"));
+        assert!(stars["detail"].as_str().unwrap().contains("`G`"));
+    }
+
+    #[test]
+    fn localization_mapping_round_trips_through_the_reverse_item() {
+        // EU B -> JP four stars (forward item), then the four-star
+        // value back to EU B through the reverse item: the projector
+        // evaluates both registered correspondences.
+        let mappings = crate::fixtures::fixture_mappings();
+        let view = pack_view_with_mappings(&mappings);
+        let stars = pack_transform(&view, "jp-star-display")["output"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut lens = crate::fixtures::pack_lens();
+        lens.transforms = vec![TransformBinding::LocalizationMapping {
+            id: "reverse".into(),
+            source: crate::fixtures::facts::ENERGY_LABEL.into(),
+            mapping_ref: crate::fixtures::JP_STAR_TO_EU_CLASS_ID.into(),
+        }];
+        // Re-key the lens to the star value: a corrected class fact
+        // holding the star string.
+        let mut system = crate::fixtures::pack_system();
+        let mut log = system.log.clone();
+        log.append(
+            TypedEvent::new(
+                system.log.len() as u64,
+                at(),
+                "economic operator",
+                "urn:unidpp:actor:oem-batteriewerke",
+                unidpp_event::EventType::Correction,
+                EventPayload::Correction {
+                    field: crate::fixtures::facts::ENERGY_LABEL.to_string(),
+                    prior_value: "B".into(),
+                    new_value: stars.clone(),
+                    reason: "the JP star display of the system class".into(),
+                },
+                TrustMarker::Attested,
+            )
+            .unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        system.log = log;
+        let view = project(
+            &system,
+            &lens,
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &mappings,
+            &ChildDocuments::empty(),
+        )
+        .unwrap();
+        let back = &view["transformed"][0];
+        assert_eq!(back["status"], json!("computed"));
+        assert_eq!(back["input"], json!(stars));
+        assert_eq!(back["output"], json!("B"));
+
+        // The acceptance round trip itself: EU A -> JP five stars
+        // through the forward item, back to A through the reverse.
+        let forward = mappings
+            .get(crate::fixtures::EU_CLASS_TO_JP_STAR_ID)
+            .unwrap()
+            .0;
+        let reverse = mappings
+            .get(crate::fixtures::JP_STAR_TO_EU_CLASS_ID)
+            .unwrap()
+            .0;
+        let five = forward.lookup("A").unwrap().target_value.clone();
+        assert_eq!(five, "★★★★★");
+        assert_eq!(reverse.lookup(&five).unwrap().target_value, "A");
+    }
+
+    #[test]
+    fn localization_mapping_without_the_item_or_fact_fails_honestly() {
+        // The projector holds no mapping: the binding says so.
+        let view = pack_view_with_mappings(&MappingSet::empty());
+        let stars = pack_transform(&view, "jp-star-display");
+        assert_eq!(stars["status"], json!("failed"));
+        assert!(stars["error"].as_str().unwrap().contains("not available"));
+
+        // Before the grading correction, the fact does not exist
+        // as-of: absent source, stated.
+        let early = Timestamp::from_secs(1_760_000_000); // 2025-10-09ish
+        let mappings = crate::fixtures::fixture_mappings();
+        let view = project(
+            &crate::fixtures::pack_system(),
+            &crate::fixtures::pack_lens(),
+            early,
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            &mappings,
+            &ChildDocuments::empty(),
+        )
+        .unwrap();
+        let stars = pack_transform(&view, "jp-star-display");
+        assert_eq!(stars["status"], json!("failed"));
+        assert!(stars["error"].as_str().unwrap().contains("absent as-of"));
+    }
+
+    /// The pack view with an explicit mapping set (default: fixtures).
+    fn pack_view_with_mappings(mappings: &MappingSet) -> Value {
+        project(
+            &crate::fixtures::pack_system(),
+            &crate::fixtures::pack_lens(),
+            at(),
+            "customs",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+            &PackageSet::empty(),
+            mappings,
+            &ChildDocuments::of(crate::fixtures::pack_children()),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn invalid_lens_is_refused() {
         let mut lens = lens_with(vec![binding("ferin:eu/score@1", "score")], vec![]);
@@ -1282,6 +1910,8 @@ mod tests {
                 &BTreeMap::new(),
                 &ProfileSource::registry(),
                 &PackageSet::empty(),
+                &MappingSet::empty(),
+                &ChildDocuments::empty(),
             ),
             Err(ViewError::Invalid(_))
         ));

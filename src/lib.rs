@@ -14,7 +14,11 @@
 //! - [`api`] — the HTTP surface (axum over tokio):
 //!   `GET /view?passport=<id>&profile=<profile-item>&actor=<role>[&at=]`
 //!   → `{profile: {id, version}, selected, transformed, coverage,
-//!   as_of, trust}`; plus `/` (service discovery) and `/healthz`;
+//!   as_of, trust}`;
+//!   `GET /render?passport=<id>&profile=<profile-item>&lang=<tag>[&at=]`
+//!   → the presentation JSON (`{render_metadata: {template_ref, lang,
+//!   formatting_rules}, sections, coverage}`); plus `/` (service
+//!   discovery) and `/healthz`;
 //! - [`twin`] — the event-log fold: replay a `unidpp/passport@1`
 //!   document's append-only log as-of an instant into twin facts,
 //!   each carrying the origin (sequence, time, actor, trust marker)
@@ -42,10 +46,27 @@
 //!   otherwise (the issuer's registry-forwarding pattern, read side);
 //! - [`http`] — the minimal async `http://` client shared by the
 //!   registry client and the integration tests (house pattern);
+//! - [`render`] — the consumer presentation render (TODO.impl 54 /
+//!   T-04): a passport under a lens *as a consumer sees it* — the
+//!   profile's data points arranged per its presentation binding
+//!   (sections, labels in the requested language, formatted values
+//!   with units, links to the authoritative sources), with the same
+//!   coverage honesty as the view;
+//! - [`aggregate`] — the aggregation transform class (TODO.impl 66 /
+//!   T-18): cross-child roll-ups over the subject's active traversal
+//!   set, methodology-bound (`method_citation`) and committed to the
+//!   input set's root hash;
+//! - [`codelist`] — the localization / code-list mapping class
+//!   (TODO.impl 67 / T-19): registered code-list correspondences
+//!   (versioned registry items; EU A–E ↔ JP star display as the
+//!   built-in fixture); unmapped values emit an explicit `unmapped`;
 //! - [`fixtures`] — the two-lens demonstration corpus: one laptop
 //!   passport (deterministic, fixed timestamps), the EU/JP lens
-//!   manifests, and the built-in battery decision-rule `.prml`
-//!   package (a guard band with w = U; efficiency class bands).
+//!   manifests, the built-in battery decision-rule `.prml` package (a
+//!   guard band with w = U; efficiency class bands), the consumer
+//!   presentation lens, and the battery-pack roll-up corpus (a pack
+//!   system over three pack children + the EU-class-to-JP-star
+//!   mapping).
 //!
 //! Division of labour (MECE): the registry owns item lifecycle
 //! (profiles, units, transform packages — versioned supersession,
@@ -61,18 +82,27 @@
 // boxing the error would complicate every call site for no gain.
 #![allow(clippy::result_large_err)]
 
+pub mod aggregate;
 pub mod api;
+pub mod codelist;
 pub mod fixtures;
 pub mod http;
 pub mod lens;
 pub mod primmel;
 pub mod project;
 pub mod registry;
+pub mod render;
 pub mod twin;
 
+pub use aggregate::{AggregationOperation, ChildDocuments};
 pub use api::{run, Config, TestServer};
-pub use lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
+pub use codelist::{CodeListMapping, MappingEntry, MappingSet};
+pub use lens::{
+    ClassBand, DataPointBinding, FormattingRules, LensManifest, PresentationBinding,
+    PresentationSection, TransformBinding, UnitPosition,
+};
 pub use primmel::{PackageSet, PrimmelPackage, PrimmelRule};
 pub use project::{project, MissingReason, ProfileSource, RegisteredUnit, ViewError};
 pub use registry::{FetchOutcome, RegistryClient};
+pub use render::render;
 pub use twin::{FactOrigin, SourcedFact, TwinState};

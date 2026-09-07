@@ -24,7 +24,12 @@ use unidpp_model::{
     TriggerPredicate, TrustMarker, VisibilityClass,
 };
 
-use crate::lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
+use crate::aggregate::AggregationOperation;
+use crate::codelist::{CodeListMapping, MappingSet};
+use crate::lens::{
+    ClassBand, DataPointBinding, FormattingRules, LensManifest, PresentationBinding,
+    PresentationElement, PresentationSection, TransformBinding,
+};
 use crate::project::RegisteredUnit;
 
 /// The demo passport id (one laptop instance, ISO/IEC 15459).
@@ -35,6 +40,30 @@ pub const EU_LENS_ID: &str = "urn:unidpp:profile:eu-espr-electronics";
 
 /// The JP lens item id.
 pub const JP_LENS_ID: &str = "urn:unidpp:profile:jp-meti-pse";
+
+/// The consumer presentation lens item id (TODO.impl 54).
+pub const CONSUMER_LENS_ID: &str = "urn:unidpp:profile:consumer-dpp";
+
+/// The EU battery-pack-system roll-up lens item id (TODO.impl 66/67).
+pub const PACK_LENS_ID: &str = "urn:unidpp:profile:eu-battery-packs";
+
+/// The battery-pack-system passport id (the aggregation subject).
+pub const PACK_SYSTEM_ID: &str =
+    "urn:iso:std:iso-iec:15459:unidpp:passport:packsystem-84120099077701";
+
+/// The three battery-pack child passport ids (the traversal set), in
+/// passport-id order.
+pub const PACK_CHILD_IDS: [&str; 3] = [
+    "urn:iso:std:iso-iec:15459:unidpp:passport:pack-84120099088001",
+    "urn:iso:std:iso-iec:15459:unidpp:passport:pack-84120099088002",
+    "urn:iso:std:iso-iec:15459:unidpp:passport:pack-84120099088003",
+];
+
+/// The EU-class-to-JP-star code-list mapping item id (TODO.impl 67).
+pub const EU_CLASS_TO_JP_STAR_ID: &str = "urn:unidpp:mapping:eu-class-to-jp-star";
+
+/// The reverse correspondence item id (JP stars back to EU classes).
+pub const JP_STAR_TO_EU_CLASS_ID: &str = "urn:unidpp:mapping:jp-star-to-eu-class";
 
 /// The canonical demonstration instant (after every demo event).
 pub const DEMO_AS_OF: &str = "2027-02-11T11:00:00Z";
@@ -51,7 +80,30 @@ pub mod facts {
     pub const SOH: &str = "battery.soh-pct";
     pub const SOH_UNCERTAINTY: &str = "battery.soh-u-pct";
     pub const ROUND_TRIP_EFFICIENCY: &str = "battery.round-trip-efficiency-pct";
+    /// Recycling instruction: deliberately NOT provided by the demo
+    /// passport (the consumer lens's explicit coverage gap).
+    pub const RECYCLING_INSTRUCTION: &str = "de.dpp.recycling-instruction";
+    /// The pack system's EU energy-label class (string code value).
+    pub const ENERGY_LABEL: &str = "eu.energy-label-class";
+    /// Per-pack carbon footprint (kgCO2e).
+    pub const PACK_CARBON: &str = "pack.carbon-footprint";
+    /// Per-pack mass (kg).
+    pub const PACK_MASS: &str = "pack.mass-kg";
+    /// Per-pack state of health (%).
+    pub const PACK_SOH: &str = "pack.soh-pct";
 }
+
+/// Canonical element refs of the consumer lens's data points.
+pub const OPERATOR_ELEMENT: &str = "ferin:eu/de.dpp.operator-id@1.0.0";
+pub const CAPACITY_ELEMENT: &str = "ferin:eu/battery.capacity-kwh@1.0.0";
+pub const REPARABILITY_ELEMENT: &str = "ferin:eu/de.dpp.reparability-score@1.1.0";
+pub const CARBON_ELEMENT: &str = "ferin:eu/de.dpp.carbon-footprint@1.2.0";
+pub const INSTRUCTION_ELEMENT: &str = "ferin:eu/de.dpp.recycling-instruction@1.0.0";
+/// Canonical element refs of the pack lens's data points.
+pub const ENERGY_LABEL_ELEMENT: &str = "ferin:eu/eu.energy-label-class@1.0.0";
+pub const PACK_CARBON_ELEMENT: &str = "ferin:eu/pack.carbon-footprint@1.0.0";
+pub const PACK_MASS_ELEMENT: &str = "ferin:eu/pack.mass-kg@1.0.0";
+pub const PACK_SOH_ELEMENT: &str = "ferin:eu/pack.soh-pct@1.0.0";
 
 /// The built-in Primmel package (fixtures mode): the battery decision
 /// rules, as a `.prml` JSON document — the exact wire shape the
@@ -91,6 +143,28 @@ pub const BATTERY_RULES_PRML: &str = r#"{
   ]
 }
 "#;
+
+/// The EU energy-label class to JP star-display correspondence (the
+/// built-in code-list mapping fixture, TODO.impl 67) — the exact wire
+/// shape the parser serves. The registered table scopes the
+/// correspondence to the A–E band (bijective onto the five-star
+/// display); values outside the band map to the explicit `unmapped`.
+pub const EU_CLASS_TO_JP_STAR_MAPPING: &str = r#"{
+  "id": "urn:unidpp:mapping:eu-class-to-jp-star",
+  "version": "1.0.0",
+  "title": "EU energy-label class to JP star display (A-E band)",
+  "citation": "Regulation (EU) 2017/1369 Annex II <-> JP METI star display",
+  "source_scheme": "urn:eu:reg:2017:1369#annex-ii-class",
+  "target_scheme": "urn:jp:meti:star-rating",
+  "table": [
+    { "source_value": "A", "target_value": "\u2605\u2605\u2605\u2605\u2605",
+      "note": "the A-E band of the EU scale maps onto the five-star display" },
+    { "source_value": "B", "target_value": "\u2605\u2605\u2605\u2605" },
+    { "source_value": "C", "target_value": "\u2605\u2605\u2605" },
+    { "source_value": "D", "target_value": "\u2605\u2605" },
+    { "source_value": "E", "target_value": "\u2605" }
+  ]
+}"#;
 
 /// The built-in Primmel package id.
 pub const BATTERY_RULES_PACKAGE_ID: &str = "urn:primmel:pkg:battery-rules";
@@ -360,6 +434,7 @@ pub fn eu_lens() -> LensManifest {
                     .collect(),
             },
         ],
+        presentation: None,
     };
     lens.validate().expect("EU lens validates");
     lens
@@ -466,9 +541,432 @@ pub fn jp_lens() -> LensManifest {
                 .collect(),
             },
         ],
+        presentation: None,
     };
     lens.validate().expect("JP lens validates");
     lens
+}
+
+/// The consumer presentation lens (TODO.impl 54): the demo passport
+/// as the `/learn` page's four readers see it — sections product /
+/// repair / recycling, per-element labels in English and Japanese, an
+/// element the passport deliberately does not provide (the recycling
+/// instruction) so the render's coverage gap is part of the demo.
+pub fn consumer_lens() -> LensManifest {
+    let labels = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(l, t)| (l.to_string(), t.to_string()))
+            .collect()
+    };
+    let presented = |element: &str, pairs: &[(&str, &str)]| PresentationElement {
+        element: element.to_string(),
+        labels: labels(pairs),
+    };
+    let section =
+        |id: &str, section_labels: &[(&str, &str)], elements: Vec<PresentationElement>| {
+            PresentationSection {
+                id: id.to_string(),
+                labels: labels(section_labels),
+                elements,
+            }
+        };
+    let lens = LensManifest {
+        version: "1.0.0".to_string(),
+        profile: ProfileManifest {
+            id: ProfileId::new(CONSUMER_LENS_ID).unwrap(),
+            axes: ProfileAxes::jurisdiction("EU"),
+            trigger: TriggerPredicate::Any,
+            min_capability: CapabilityClass::Silent,
+            freshness: FreshnessRequirement::Static,
+            effective: Interval::starting(ts("2026-01-01T00:00:00Z")),
+            data_points: vec![
+                DataPointRef::new("ferin:eu", "de.dpp.operator-id", Some("1.0.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "battery.capacity-kwh", Some("1.0.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "de.dpp.reparability-score", Some("1.1.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "de.dpp.carbon-footprint", Some("1.2.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "de.dpp.recycling-instruction", Some("1.0.0"))
+                    .unwrap(),
+            ],
+            crypto_suites: vec![SignatureSuite::EcdsaP256],
+            confidential: false,
+            resolution: Resolution::Public,
+            edge_visibility: VisibilityClass::Public,
+            traversal: Traversal::Public,
+        },
+        bindings: vec![
+            DataPointBinding {
+                element: OPERATOR_ELEMENT.into(),
+                source: f::OPERATOR_ID.into(),
+                min_trust: TrustMarker::Attested,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: None,
+            },
+            DataPointBinding {
+                element: CAPACITY_ELEMENT.into(),
+                source: f::CAPACITY_KWH.into(),
+                min_trust: TrustMarker::SelfDeclared,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: Some("kWh".into()),
+            },
+            DataPointBinding {
+                element: REPARABILITY_ELEMENT.into(),
+                source: f::REPARABILITY.into(),
+                min_trust: TrustMarker::SelfDeclared,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: None,
+            },
+            DataPointBinding {
+                element: CARBON_ELEMENT.into(),
+                source: f::CARBON.into(),
+                min_trust: TrustMarker::SelfDeclared,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: Some("kgCO2e".into()),
+            },
+            DataPointBinding {
+                // Deliberately not provided by the demo passport: the
+                // render must show its gap, not hide it.
+                element: INSTRUCTION_ELEMENT.into(),
+                source: f::RECYCLING_INSTRUCTION.into(),
+                min_trust: TrustMarker::SelfDeclared,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: None,
+            },
+        ],
+        transforms: vec![],
+        presentation: Some(PresentationBinding {
+            template_ref: "urn:unidpp:template:consumer-v1".to_string(),
+            formatting: FormattingRules::default(),
+            sections: vec![
+                section(
+                    "product",
+                    &[("en", "Product"), ("ja", "製品情報")],
+                    vec![
+                        presented(OPERATOR_ELEMENT, &[("en", "Operator"), ("ja", "事業者ID")]),
+                        presented(
+                            CAPACITY_ELEMENT,
+                            &[("en", "Battery capacity"), ("ja", "電池容量")],
+                        ),
+                    ],
+                ),
+                section(
+                    "repair",
+                    &[("en", "Repair"), ("ja", "修理")],
+                    vec![presented(
+                        REPARABILITY_ELEMENT,
+                        &[("en", "Reparability score"), ("ja", "修理容易性スコア")],
+                    )],
+                ),
+                section(
+                    "recycling",
+                    &[("en", "Recycling"), ("ja", "リサイクル")],
+                    vec![
+                        presented(
+                            CARBON_ELEMENT,
+                            &[("en", "Carbon footprint"), ("ja", "炭素フットプリント")],
+                        ),
+                        presented(
+                            INSTRUCTION_ELEMENT,
+                            &[("en", "Recycling instruction"), ("ja", "リサイクル手順")],
+                        ),
+                    ],
+                ),
+            ],
+        }),
+    };
+    lens.validate().expect("consumer lens validates");
+    lens
+}
+
+/// One battery-pack child: issued, then an attested milestone carrying
+/// its carbon footprint (kgCO2e), mass (kg) and state of health (%).
+/// Values chosen so the demo weighted average divides exactly.
+pub fn pack_child(index: usize) -> Passport {
+    let carbon = ["31.5", "33.0", "25.5"][index];
+    let mass = ["12.5", "15.5", "12.0"][index];
+    let soh = ["91.2", "88.4", "86.9"][index];
+    let issued = [
+        "2027-01-05T09:00:00Z",
+        "2027-01-05T09:05:00Z",
+        "2027-01-05T09:10:00Z",
+    ][index];
+    let passport_id = pid(PACK_CHILD_IDS[index]);
+    let mut log = EventLog::new(passport_id.clone());
+    let events: Vec<TypedEvent> = vec![
+        event(
+            0,
+            issued,
+            "issuing authority",
+            "urn:unidpp:actor:oem-batteriewerke",
+            EventType::Issuance,
+            EventPayload::Issuance {
+                derived: false,
+                inputs: vec![],
+            },
+            TrustMarker::Attested,
+        ),
+        event(
+            1,
+            "2027-01-05T12:00:00Z",
+            "economic operator",
+            "urn:unidpp:actor:oem-batteriewerke",
+            EventType::MilestoneRecord,
+            EventPayload::MilestoneRecord {
+                counters: [
+                    (f::PACK_CARBON.to_string(), carbon.parse().unwrap()),
+                    (f::PACK_MASS.to_string(), mass.parse().unwrap()),
+                    (f::PACK_SOH.to_string(), soh.parse().unwrap()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            TrustMarker::Attested,
+        ),
+    ];
+    for e in events {
+        log.append(e, None, None)
+            .expect("fixture pack events append cleanly");
+    }
+    Passport {
+        schema: SCHEMA.to_string(),
+        passport_id,
+        product_id: ProductIdentifier::parse(&format!(
+            "cpid:urn:iso:std:iso-iec:15459:unidpp:inst:8412009908800{}",
+            index + 1
+        ))
+        .expect("fixture product identifier parses"),
+        type_ref: Some("battery-pack-hw-rev-a".to_string()),
+        capability: CapabilityClass::PassiveAuth,
+        eo_id: "urn:unidpp:actor:oem-batteriewerke".to_string(),
+        resolver_uri: format!("https://dpp.unidpp.org/r/8412009908800{}", index + 1),
+        validity: Interval {
+            from: ts(issued),
+            to: Some(ts("2042-01-05T09:00:00Z")),
+        },
+        created_at: ts(issued),
+        log,
+        event_signatures: Vec::new(),
+    }
+}
+
+/// The three battery-pack children, in passport-id order.
+pub fn pack_children() -> Vec<Passport> {
+    (0..3).map(pack_child).collect()
+}
+
+/// The battery-pack system passport (the aggregation subject): a
+/// derived issuance over the three packs — each input reference pins
+/// the child's log head as-of the composition — plus the system's EU
+/// energy-label class (the code value the localization mapping
+/// translates).
+pub fn pack_system() -> Passport {
+    let children = pack_children();
+    let composed_at = ts("2027-01-06T10:00:00Z");
+    let inputs: Vec<unidpp_transform::InputReference> = children
+        .iter()
+        .zip(["12.5", "15.5", "12.0"])
+        .map(|(child, mass)| unidpp_transform::InputReference {
+            input: child.passport_id.clone(),
+            quantity: unidpp_transform::Quantity::new(
+                mass.parse().unwrap(),
+                unidpp_transform::quantity::Unit::new("kg", "urn:iso:std:iso:80000-4").unwrap(),
+            ),
+            as_of_state_hash: child
+                .log
+                .state_hash_at(ts("2027-01-05T12:00:00Z"))
+                .expect("child log has a state hash at its milestone"),
+        })
+        .collect();
+    let passport_id = pid(PACK_SYSTEM_ID);
+    let mut log = EventLog::new(passport_id.clone());
+    let events: Vec<TypedEvent> = vec![
+        event(
+            0,
+            "2027-01-06T10:00:00Z",
+            "issuing authority",
+            "urn:unidpp:actor:oem-batteriewerke",
+            EventType::Issuance,
+            EventPayload::Issuance {
+                derived: true,
+                inputs,
+            },
+            TrustMarker::Attested,
+        ),
+        event(
+            1,
+            "2027-01-06T10:05:00Z",
+            "conformity assessment body",
+            "urn:unidpp:actor:cab-eu-notified",
+            EventType::Correction,
+            EventPayload::Correction {
+                field: f::ENERGY_LABEL.into(),
+                prior_value: String::new(),
+                new_value: "B".into(),
+                reason: "EU energy-label class of the pack system".into(),
+            },
+            TrustMarker::Attested,
+        ),
+    ];
+    for e in events {
+        log.append(e, None, None)
+            .expect("fixture system events append cleanly");
+    }
+    Passport {
+        schema: SCHEMA.to_string(),
+        passport_id,
+        product_id: ProductIdentifier::parse(
+            "cpid:urn:iso:std:iso-iec:15459:unidpp:inst:84120099077701",
+        )
+        .expect("fixture product identifier parses"),
+        type_ref: Some("battery-pack-system-rev-a".to_string()),
+        capability: CapabilityClass::PassiveAuth,
+        eo_id: "urn:unidpp:actor:oem-batteriewerke".to_string(),
+        resolver_uri: "https://dpp.unidpp.org/r/84120099077701".to_string(),
+        validity: Interval {
+            from: composed_at,
+            to: Some(ts("2042-01-06T10:00:00Z")),
+        },
+        created_at: composed_at,
+        log,
+        event_signatures: Vec::new(),
+    }
+}
+
+/// The EU battery-pack-system lens (TODO.impl 66 + 67): the roll-up
+/// profile. The pack elements (carbon, mass, SoH) are data points of
+/// the *packs* — the system twin state does not carry them, so the
+/// subject-level coverage honestly reports them absent while the
+/// aggregation transforms select them from every child of the
+/// traversal set (the binding supplies the fact path and the gates).
+pub fn pack_lens() -> LensManifest {
+    let lens = LensManifest {
+        version: "1.0.0".to_string(),
+        profile: ProfileManifest {
+            id: ProfileId::new(PACK_LENS_ID).unwrap(),
+            axes: ProfileAxes::jurisdiction("EU").with_sector("batteries"),
+            trigger: TriggerPredicate::Any,
+            min_capability: CapabilityClass::Silent,
+            freshness: FreshnessRequirement::Static,
+            effective: Interval::starting(ts("2027-01-01T00:00:00Z")),
+            data_points: vec![
+                DataPointRef::new("ferin:eu", "eu.energy-label-class", Some("1.0.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "pack.carbon-footprint", Some("1.0.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "pack.mass-kg", Some("1.0.0")).unwrap(),
+                DataPointRef::new("ferin:eu", "pack.soh-pct", Some("1.0.0")).unwrap(),
+            ],
+            crypto_suites: vec![SignatureSuite::EcdsaP256],
+            confidential: false,
+            resolution: Resolution::Public,
+            edge_visibility: VisibilityClass::Blind,
+            traversal: Traversal::RoleScoped,
+        },
+        bindings: vec![
+            DataPointBinding {
+                element: ENERGY_LABEL_ELEMENT.into(),
+                source: f::ENERGY_LABEL.into(),
+                min_trust: TrustMarker::Attested,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: None,
+            },
+            DataPointBinding {
+                element: PACK_CARBON_ELEMENT.into(),
+                source: f::PACK_CARBON.into(),
+                min_trust: TrustMarker::Attested,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: Some("kgCO2e".into()),
+            },
+            DataPointBinding {
+                element: PACK_MASS_ELEMENT.into(),
+                source: f::PACK_MASS.into(),
+                min_trust: TrustMarker::Attested,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: Some("kg".into()),
+            },
+            DataPointBinding {
+                element: PACK_SOH_ELEMENT.into(),
+                source: f::PACK_SOH.into(),
+                min_trust: TrustMarker::Attested,
+                min_capability: CapabilityClass::Silent,
+                declared_unit: Some("%".into()),
+            },
+        ],
+        transforms: vec![
+            // The carbon roll-up across the three packs, methodology
+            // bound to ISO 14067 (never invented).
+            TransformBinding::Aggregation {
+                id: "carbon-rollup".into(),
+                operation: AggregationOperation::Sum,
+                input_element: PACK_CARBON_ELEMENT.into(),
+                weight_element: None,
+                method_citation: "ISO 14067:2018".into(),
+            },
+            // The mass-weighted average state of health: exact
+            // division by construction of the fixture values.
+            TransformBinding::Aggregation {
+                id: "soh-weighted-average".into(),
+                operation: AggregationOperation::WeightedAverage,
+                input_element: PACK_SOH_ELEMENT.into(),
+                weight_element: Some(PACK_MASS_ELEMENT.into()),
+                method_citation: "IEC 62660-1:2018".into(),
+            },
+            // The system's EU class, localized to the JP star display
+            // through the registered correspondence item (B -> four
+            // stars; a class outside the band maps to `unmapped`).
+            TransformBinding::LocalizationMapping {
+                id: "jp-star-display".into(),
+                source: f::ENERGY_LABEL.into(),
+                mapping_ref: EU_CLASS_TO_JP_STAR_ID.into(),
+            },
+        ],
+        presentation: None,
+    };
+    lens.validate().expect("pack lens validates");
+    lens
+}
+
+/// The built-in EU class to JP star mapping, parsed from its wire
+/// document (the fixture proves the schema end to end).
+pub fn eu_class_to_jp_star_mapping() -> CodeListMapping {
+    let doc: serde_json::Value =
+        serde_json::from_str(EU_CLASS_TO_JP_STAR_MAPPING).expect("fixture mapping is valid JSON");
+    CodeListMapping::from_json(&doc).expect("fixture mapping validates")
+}
+
+/// The reverse correspondence (JP stars back to EU classes), as its
+/// own registered item — the round-trip fixture.
+pub fn jp_star_to_eu_class_mapping() -> CodeListMapping {
+    let mut reverse = eu_class_to_jp_star_mapping()
+        .reversed()
+        .expect("the fixture table is bijective");
+    reverse.id = JP_STAR_TO_EU_CLASS_ID.to_string();
+    reverse.validate().expect("reverse mapping validates");
+    reverse
+}
+
+/// The built-in code-list mappings (fixtures mode).
+pub fn fixture_mappings() -> MappingSet {
+    let mut set = MappingSet::empty();
+    set.insert(eu_class_to_jp_star_mapping(), "fixtures");
+    set.insert(jp_star_to_eu_class_mapping(), "fixtures");
+    set
+}
+
+/// One built-in child passport by id, when the fixture corpus holds
+/// it (the pack children; the laptop's sodimm parts have no fixture
+/// documents — an aggregation over them would report the documents as
+/// unavailable, honestly).
+pub fn fixture_child(passport_id: &str) -> Option<Passport> {
+    let index = PACK_CHILD_IDS.iter().position(|id| *id == passport_id)?;
+    Some(pack_child(index))
+}
+
+/// The child documents of a fixture parent (the pack system's three
+/// packs; nothing for the demo laptop).
+pub fn fixture_children_of(parent_id: &str) -> Vec<Passport> {
+    match parent_id {
+        PACK_SYSTEM_ID => pack_children(),
+        _ => Vec::new(),
+    }
 }
 
 /// A built-in lens by profile item id (the fixtures-mode registry).
@@ -476,6 +974,8 @@ pub fn fixture_lens(profile_id: &str) -> Option<LensManifest> {
     match profile_id {
         EU_LENS_ID => Some(eu_lens()),
         JP_LENS_ID => Some(jp_lens()),
+        CONSUMER_LENS_ID => Some(consumer_lens()),
+        PACK_LENS_ID => Some(pack_lens()),
         _ => None,
     }
 }
@@ -590,6 +1090,94 @@ mod tests {
             assert!(matches!(fact.value, unidpp_model::FactValue::Num(_)));
             assert_eq!(fact.origin.trust, TrustMarker::Attested);
         }
+    }
+
+    #[test]
+    fn pack_corpus_is_deterministic_and_consistent() {
+        // Structural determinism (the documents are built, never
+        // minted against the wall clock).
+        assert_eq!(pack_system(), pack_system());
+        for i in 0..3 {
+            assert_eq!(pack_child(i), pack_child(i));
+        }
+        let system = pack_system();
+        system
+            .log
+            .verify()
+            .expect("pack system hash chain verifies");
+        for child in pack_children() {
+            child.log.verify().expect("pack child hash chain verifies");
+            let doc = child.to_json().unwrap();
+            let back = Passport::from_json(&doc).unwrap();
+            assert_eq!(back, child);
+        }
+
+        // The system's derived issuance names the three packs, each
+        // input pinning the child's log head as-of the composition —
+        // the traversal set the aggregation consumes.
+        let state = crate::twin::fold(&system, demo_as_of());
+        let active: Vec<&str> = state.children.iter().map(String::as_str).collect();
+        assert_eq!(active, PACK_CHILD_IDS.to_vec());
+        // Before the composition, no children.
+        let before = ts("2027-01-05T12:00:00Z");
+        assert!(crate::twin::fold(&system, before).children.is_empty());
+        // The system's own fact: the EU energy-label class.
+        assert_eq!(
+            state.get(facts::ENERGY_LABEL).unwrap().value,
+            unidpp_model::FactValue::Str("B".into())
+        );
+    }
+
+    #[test]
+    fn fixture_children_resolve_by_id() {
+        assert_eq!(fixture_child(PACK_CHILD_IDS[1]).unwrap(), pack_child(1));
+        assert!(fixture_child("urn:unidpp:passport:none").is_none());
+        assert_eq!(fixture_children_of(PACK_SYSTEM_ID), pack_children());
+        assert!(fixture_children_of(DEMO_PASSPORT_ID).is_empty());
+    }
+
+    #[test]
+    fn code_list_fixture_round_trips_and_is_bijective() {
+        let forward = eu_class_to_jp_star_mapping();
+        assert_eq!(forward.id, EU_CLASS_TO_JP_STAR_ID);
+        assert_eq!(forward.table.len(), 5);
+        // B -> four stars.
+        assert_eq!(forward.lookup("B").unwrap().target_value, "★★★★");
+        // The A-E band maps onto the five-star display; values outside
+        // the band are unmapped.
+        assert!(forward.lookup("F").is_none());
+        assert!(forward.lookup("G").is_none());
+        // The reverse item is its own registered identity and round
+        // trips the correspondence.
+        let reverse = jp_star_to_eu_class_mapping();
+        assert_eq!(reverse.id, JP_STAR_TO_EU_CLASS_ID);
+        assert_eq!(reverse.lookup("★★★★").unwrap().target_value, "B");
+        assert_eq!(reverse.lookup("★★★★★").unwrap().target_value, "A");
+        // The fixture set holds both, sourced fixtures.
+        let set = fixture_mappings();
+        let (got, source) = set.get(EU_CLASS_TO_JP_STAR_ID).unwrap();
+        assert_eq!(got.id, EU_CLASS_TO_JP_STAR_ID);
+        assert_eq!(source, "fixtures");
+        assert!(set.get(JP_STAR_TO_EU_CLASS_ID).is_some());
+    }
+
+    #[test]
+    fn consumer_lens_presents_localized_sections() {
+        let consumer = consumer_lens();
+        let presentation = consumer.presentation.as_ref().unwrap();
+        assert_eq!(presentation.template_ref, "urn:unidpp:template:consumer-v1");
+        for section in &presentation.sections {
+            assert!(section.labels.contains_key("en"));
+            assert!(section.labels.contains_key("ja"));
+            for element in &section.elements {
+                assert!(element.labels.contains_key("en"));
+                assert!(element.labels.contains_key("ja"));
+            }
+        }
+        // The demo passport provides every presented element except
+        // the recycling instruction — the render's coverage gap.
+        let state = crate::twin::fold(&demo_passport(), demo_as_of());
+        assert!(state.get(facts::RECYCLING_INSTRUCTION).is_none());
     }
 
     #[test]

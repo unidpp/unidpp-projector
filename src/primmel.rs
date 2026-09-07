@@ -327,8 +327,13 @@ fn eval_expr(expr: &Expr, inputs: &BTreeMap<String, Decimal>) -> Result<Decimal,
 
 /// Explicit rounding on the exact decimal: keep `decimals` fractional
 /// digits, resolve midpoints by `mode`. No other rounding exists in
-/// the evaluator.
-fn round_decimal(v: Decimal, decimals: u8, mode: RoundingMode) -> Result<Decimal, EvalError> {
+/// the evaluator (the presentation render's display formatting
+/// reuses this — the only rounding in the crate).
+pub(crate) fn round_decimal(
+    v: Decimal,
+    decimals: u8,
+    mode: RoundingMode,
+) -> Result<Decimal, EvalError> {
     if decimals > 18 {
         return Err(EvalError::Arithmetic(format!(
             "rounding to {decimals} decimals exceeds the decimal domain"
