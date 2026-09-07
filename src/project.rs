@@ -1,0 +1,888 @@
+//! The projection engine: render a passport under a lens at an
+//! instant — select, transform, cover.
+//!
+//! Deterministic by construction: the same passport document, lens
+//! manifest, and `as-of` instant produce the same view bytes (the
+//! B4 border moment as a service: an offline terminal re-projects and
+//! gets the same answer). Selection applies the manifest's
+//! data-point bindings in three named gates, reported honestly when
+//! they fail:
+//!
+//! 1. **capability gate** — the subject's capability class must meet
+//!    the binding's floor (the silent-object lesson: an S0 subject
+//!    cannot attest what it has no means to attest);
+//! 2. **presence** — the source fact must exist on the twin state
+//!    as-of the instant;
+//! 3. **provenance filter** — the sourcing event's trust marker must
+//!    meet the binding's floor (I9 ladder).
+//!
+//! Transforms run in manifest order through the exact machinery of
+//! the core crates (unit conversion via the ISO 80000 unit registry:
+//! kWh -> MJ is x 3.6 exactly; band classification from the
+//! manifest's own table), and every derived value carries the trust
+//! marker of its input — a derived value is never more trustworthy
+//! than what it was computed from.
+
+use std::collections::BTreeMap;
+
+use serde_json::{json, Map, Value};
+
+use unidpp_cli::passport::Passport;
+use unidpp_model::{CapabilityClass, Decimal, FactValue, Timestamp, TrustMarker};
+use unidpp_transform::quantity::{Quantity, UnitRegistry};
+use unidpp_verdict::CoverageReport;
+
+use crate::lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
+use crate::twin::{self, SourcedFact};
+
+/// Why an element is missing from a view.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "reason", rename_all = "kebab-case")]
+pub enum MissingReason {
+    /// The source fact does not exist on the twin state as-of the
+    /// view instant.
+    AbsentAsOf,
+    /// The sourcing event's trust marker is below the binding floor.
+    BelowTrustFloor { floor: TrustMarker },
+    /// The subject's capability class is below the binding floor.
+    CapabilityGate { floor: CapabilityClass },
+}
+
+impl MissingReason {
+    fn detail(&self) -> String {
+        match self {
+            MissingReason::AbsentAsOf => {
+                "no event wrote this fact at or before the as-of instant".to_string()
+            }
+            MissingReason::BelowTrustFloor { floor } => {
+                format!("sourcing event below the lens trust floor `{floor}`")
+            }
+            MissingReason::CapabilityGate { floor } => {
+                format!("subject capability below the element gate `{floor}`")
+            }
+        }
+    }
+}
+
+/// A registered unit identity resolved from the registry's units
+/// subregister (item id, name, ISO 80000 citation chain).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RegisteredUnit {
+    pub item: String,
+    pub name: String,
+    pub citation: Option<String>,
+}
+
+/// Where the lens manifest came from (honesty field of the view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSource {
+    /// `registry` | `fixtures` | `unreachable` (the fallback modes).
+    pub mode: String,
+    /// Extra detail for fallback modes; `None` when authoritative.
+    pub detail: Option<String>,
+}
+
+impl ProfileSource {
+    /// Authoritative registry mode.
+    pub fn registry() -> ProfileSource {
+        ProfileSource {
+            mode: "registry".to_string(),
+            detail: None,
+        }
+    }
+
+    /// Fixture fallback mode with its explanation.
+    pub fn fallback(mode: &str, detail: Option<String>) -> ProfileSource {
+        ProfileSource {
+            mode: mode.to_string(),
+            detail,
+        }
+    }
+}
+
+/// Projection failures that make a view impossible (structural, not
+/// data, problems — data problems are reported *in* the view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewError {
+    /// The lens manifest is unusable (should have been caught at
+    /// parse; the engine never renders an invalid lens).
+    Invalid(String),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Invalid(m) => write!(f, "invalid lens: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ViewError {}
+
+/// Render the view. `actor` names the requesting role (recorded, not
+/// authenticated — identity is the issuer's concern); `units` maps
+/// registry unit item ids to their resolved identities (absent when
+/// the registry could not serve them); `source` reports where the
+/// manifest came from.
+pub fn project(
+    passport: &Passport,
+    lens: &LensManifest,
+    at: Timestamp,
+    actor: &str,
+    units: &BTreeMap<String, RegisteredUnit>,
+    source: &ProfileSource,
+) -> Result<Value, ViewError> {
+    lens.validate().map_err(ViewError::Invalid)?;
+    let state = twin::fold(passport, at);
+    let core_facts = state.to_core_facts();
+
+    // --- selection -----------------------------------------------------
+    let mut selected: Vec<Value> = Vec::new();
+    let mut missing: Vec<(String, MissingReason)> = Vec::new();
+    let mut trust: BTreeMap<String, String> = BTreeMap::new();
+    let mut provided: Vec<String> = Vec::new();
+    for dp in &lens.profile.data_points {
+        let element = dp.to_string();
+        let binding = lens
+            .bindings
+            .iter()
+            .find(|b| b.element == element)
+            .ok_or_else(|| ViewError::Invalid(format!("data point `{element}` has no binding")))?;
+        match select(passport, &state, binding) {
+            Selection::Blocked(reason) => missing.push((element, reason)),
+            Selection::Found(fact) => {
+                provided.push(element.clone());
+                trust.insert(element.clone(), fact.origin.trust.to_string());
+                selected.push(selected_json(&element, binding, fact));
+            }
+        }
+    }
+
+    // --- transforms ----------------------------------------------------
+    let unit_registry = UnitRegistry::iso80000();
+    let mut transformed: Vec<Value> = Vec::new();
+    for binding in &lens.transforms {
+        transformed.push(transform_json(binding, &state, &unit_registry, units, at));
+    }
+
+    // --- coverage (reusing the verdict crate's report) ------------------
+    let provided_set: std::collections::BTreeSet<String> = provided.iter().cloned().collect();
+    let report = CoverageReport::from_profile(&lens.profile, &provided_set);
+    let missing_json: Vec<Value> = missing
+        .iter()
+        .map(|(element, reason)| {
+            let mut m = Map::new();
+            m.insert("element".into(), json!(element));
+            if let Value::Object(fields) = serde_json::to_value(reason).unwrap() {
+                for (k, v) in fields {
+                    m.insert(k, v);
+                }
+            }
+            m.insert("detail".into(), json!(reason.detail()));
+            Value::Object(m)
+        })
+        .collect();
+
+    // --- profile block -------------------------------------------------
+    let mut profile = Map::new();
+    profile.insert("id".into(), json!(lens.profile.id.as_str()));
+    profile.insert("version".into(), json!(lens.version));
+    profile.insert("axes".into(), json!(lens.profile.axes.to_string()));
+    profile.insert("trigger".into(), json!(lens.profile.trigger.describe()));
+    profile.insert(
+        "freshness".into(),
+        json!(lens.profile.freshness.to_string()),
+    );
+    profile.insert(
+        "min_capability".into(),
+        json!(lens.profile.min_capability.to_string()),
+    );
+    profile.insert(
+        "applies".into(),
+        json!(lens.profile.applies_to(&core_facts, at)),
+    );
+    profile.insert(
+        "satisfiable".into(),
+        json!(lens.profile.is_satisfiable_by(passport.capability)),
+    );
+    profile.insert(
+        "resolution".into(),
+        json!(lens.profile.resolution.to_string()),
+    );
+    profile.insert("source".into(), json!(source.mode));
+    if let Some(d) = &source.detail {
+        profile.insert("source_detail".into(), json!(d));
+    }
+
+    // --- passport block --------------------------------------------------
+    let mut passport_block = Map::new();
+    passport_block.insert("id".into(), json!(passport.passport_id.as_str()));
+    passport_block.insert("product_id".into(), json!(passport.product_id.to_string()));
+    passport_block.insert("capability".into(), json!(passport.capability.to_string()));
+    passport_block.insert("status".into(), json!(state.status.to_string()));
+    if let Some(c) = &state.custodian {
+        passport_block.insert("custodian".into(), json!(c));
+    }
+    passport_block.insert("events".into(), json!(state.event_count));
+    if let Some(head) = passport.log.state_hash_at(at) {
+        passport_block.insert("log_head".into(), json!(head.hex()));
+    }
+    passport_block.insert(
+        "validity".into(),
+        json!({
+            "from": passport.validity.from.to_string(),
+            "to": passport.validity.to.map(|t| t.to_string()),
+            "contains_as_of": passport.validity.contains(at),
+        }),
+    );
+
+    let mut view = Map::new();
+    view.insert("service".into(), json!("unidpp-projector"));
+    view.insert("actor".into(), json!(actor));
+    view.insert("as_of".into(), json!(at.to_string()));
+    view.insert("passport".into(), Value::Object(passport_block));
+    view.insert("profile".into(), Value::Object(profile));
+    view.insert("selected".into(), Value::Array(selected));
+    view.insert("transformed".into(), Value::Array(transformed));
+    view.insert(
+        "coverage".into(),
+        json!({
+            "elements_required": report.required.len(),
+            "elements_present": report.present.len(),
+            "missing": missing_json,
+            "complete": report.is_complete(),
+            "ratio": report.ratio(),
+        }),
+    );
+    view.insert("trust".into(), serde_json::to_value(trust).unwrap());
+    Ok(Value::Object(view))
+}
+
+/// The outcome of evaluating one binding.
+enum Selection<'a> {
+    Found(&'a SourcedFact),
+    Blocked(MissingReason),
+}
+
+fn select<'a>(
+    passport: &Passport,
+    state: &'a twin::TwinState,
+    binding: &DataPointBinding,
+) -> Selection<'a> {
+    // Gate 1: capability (a property of the subject, not the value).
+    if passport.capability < binding.min_capability {
+        return Selection::Blocked(MissingReason::CapabilityGate {
+            floor: binding.min_capability,
+        });
+    }
+    // Gate 2: presence on the twin state (already folded as-of).
+    let Some(fact) = state.get(&binding.source) else {
+        return Selection::Blocked(MissingReason::AbsentAsOf);
+    };
+    // Gate 3: provenance floor.
+    if !fact.origin.trust.meets(binding.min_trust) {
+        return Selection::Blocked(MissingReason::BelowTrustFloor {
+            floor: binding.min_trust,
+        });
+    }
+    Selection::Found(fact)
+}
+
+fn selected_json(element: &str, binding: &DataPointBinding, fact: &SourcedFact) -> Value {
+    let mut m = Map::new();
+    m.insert("element".into(), json!(element));
+    m.insert("value".into(), fact_value_json(&fact.value));
+    m.insert("kind".into(), json!(fact.value.type_name()));
+    if let Some(u) = &binding.declared_unit {
+        m.insert("declared_unit".into(), json!(u));
+    }
+    m.insert(
+        "sourced".into(),
+        json!({
+            "seq": fact.origin.seq,
+            "occurred_at": fact.origin.occurred_at.to_string(),
+            "actor_role": fact.origin.actor_role,
+            "actor_id": fact.origin.actor_id,
+        }),
+    );
+    m.insert("trust".into(), json!(fact.origin.trust.to_string()));
+    Value::Object(m)
+}
+
+/// A fact value as plain JSON: decimals stay exact strings, booleans
+/// and lists are native, strings are strings.
+fn fact_value_json(value: &FactValue) -> Value {
+    match value {
+        FactValue::Str(s) => json!(s),
+        FactValue::Num(d) => json!(d.to_string()),
+        FactValue::Bool(b) => json!(b),
+        FactValue::List(l) => json!(l),
+    }
+}
+
+fn transform_json(
+    binding: &TransformBinding,
+    state: &twin::TwinState,
+    unit_registry: &UnitRegistry,
+    units: &BTreeMap<String, RegisteredUnit>,
+    at: Timestamp,
+) -> Value {
+    let mut m = Map::new();
+    m.insert("id".into(), json!(binding.id()));
+    let kind = match binding {
+        TransformBinding::UnitConversion { .. } => "unit-conversion",
+        TransformBinding::Classification { .. } => "classification",
+    };
+    m.insert("kind".into(), json!(kind));
+    m.insert("source".into(), json!(binding.source()));
+    let fact = state.get(binding.source());
+    let computed: Option<Value> = match binding {
+        TransformBinding::UnitConversion {
+            from_unit,
+            to_unit,
+            from_item,
+            to_item,
+            ..
+        } => fact.and_then(|fact| match &fact.value {
+            FactValue::Num(amount) => unit_conversion_json(
+                amount,
+                from_unit,
+                to_unit,
+                from_item,
+                to_item,
+                unit_registry,
+                units,
+            ),
+            _ => None,
+        }),
+        TransformBinding::Classification { bands, .. } => {
+            fact.and_then(|fact| match &fact.value {
+                FactValue::Num(v) => Some(match classify(bands, v) {
+                    Some(band) => json!({
+                        "output": band.label,
+                        "band": {"label": band.label, "min": band.min.to_string()},
+                    }),
+                    // Below the lowest band: explicit, never silent.
+                    None => json!({
+                        "output": "unclassified",
+                        "below_lowest_band": bands
+                            .iter()
+                            .map(|b| b.min.to_string())
+                            .min()
+                            .unwrap_or_default(),
+                    }),
+                }),
+                _ => None,
+            })
+        }
+    };
+    // The input travels with the transform whatever happens (so a
+    // failed transform still states what it was asked to compute).
+    if let Some(fact) = fact {
+        m.insert("input".into(), fact_value_json(&fact.value));
+        m.insert("trust".into(), json!(fact.origin.trust.to_string()));
+    }
+    match computed {
+        Some(fields) => {
+            if let Value::Object(extra) = fields {
+                for (k, v) in extra {
+                    m.insert(k, v);
+                }
+            }
+            m.insert("status".into(), json!("computed"));
+        }
+        None => {
+            let error = if fact.is_none() {
+                format!("source fact `{}` is absent as-of {}", binding.source(), at)
+            } else {
+                match binding {
+                    TransformBinding::UnitConversion {
+                        from_unit, to_unit, ..
+                    } => format!(
+                        "cannot convert source value from `{from_unit}` to `{to_unit}` \
+                         (dimension mismatch or unregistered unit)"
+                    ),
+                    TransformBinding::Classification { .. } => {
+                        "classification source is not a numeric fact".to_string()
+                    }
+                }
+            };
+            m.insert("status".into(), json!("failed"));
+            m.insert("error".into(), json!(error));
+        }
+    }
+    Value::Object(m)
+}
+
+/// The exact conversion and the resolved unit identities. `None` when
+/// the source is not a numeric fact in a registered unit — the caller
+/// reports the failure with its reason.
+fn unit_conversion_json(
+    amount: &Decimal,
+    from_unit: &str,
+    to_unit: &str,
+    from_item: &Option<String>,
+    to_item: &Option<String>,
+    unit_registry: &UnitRegistry,
+    units: &BTreeMap<String, RegisteredUnit>,
+) -> Option<Value> {
+    let input = Quantity::parse(&amount.to_string(), from_unit, unit_registry).ok()?;
+    let target = unit_registry.unit(to_unit).ok()?;
+    let output = input.convert_to(&target, unit_registry).ok()?;
+    let mut fields = Map::new();
+    fields.insert(
+        "input".into(),
+        json!({"amount": amount.to_string(), "unit": from_unit}),
+    );
+    fields.insert(
+        "output".into(),
+        json!({"amount": output.amount.to_string(), "unit": to_unit}),
+    );
+    fields.insert("exact".into(), json!(true));
+    let mut units_block = Map::new();
+    units_block.insert(from_unit.to_string(), unit_identity_json(from_item, units));
+    units_block.insert(to_unit.to_string(), unit_identity_json(to_item, units));
+    fields.insert("units".into(), Value::Object(units_block));
+    Some(Value::Object(fields))
+}
+
+/// The band the value falls into: the highest `min` the value meets;
+/// below the lowest band the value is `unclassified` (`None` here).
+fn classify<'a>(bands: &'a [ClassBand], value: &Decimal) -> Option<&'a ClassBand> {
+    let mut ordered: Vec<&ClassBand> = bands.iter().collect();
+    ordered.sort_by_key(|band| std::cmp::Reverse(band.min));
+    ordered.into_iter().find(|band| value >= &band.min)
+}
+
+fn unit_identity_json(item: &Option<String>, units: &BTreeMap<String, RegisteredUnit>) -> Value {
+    match item.as_deref().and_then(|id| units.get(id)) {
+        Some(u) => json!({
+            "uom_registered": true,
+            "item": u.item,
+            "name": u.name,
+            "citation": u.citation,
+        }),
+        None => match item {
+            Some(id) => json!({
+                "uom_registered": false,
+                "item": id,
+                "note": "unit item not resolvable from the registry as-of this view",
+            }),
+            None => json!({"uom_registered": false}),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lens::{ClassBand, DataPointBinding};
+    use unidpp_event::{EventLog, EventPayload, TypedEvent};
+    use unidpp_model::{
+        CapabilityClass, DataPointRef, FreshnessRequirement, Interval, PassportId, ProfileAxes,
+        ProfileManifest, Resolution, SignatureSuite, Traversal, TriggerPredicate, VisibilityClass,
+    };
+
+    fn at() -> Timestamp {
+        Timestamp::from_secs(1_800_000_000)
+    }
+
+    fn event(seq: u64, payload: EventPayload, trust: TrustMarker) -> TypedEvent {
+        TypedEvent::new(
+            seq,
+            Timestamp::from_secs(1_700_000_000 + seq as i64),
+            "economic operator",
+            "urn:unidpp:actor:test",
+            payload.event_type(),
+            payload,
+            trust,
+        )
+        .unwrap()
+    }
+
+    fn passport_with(capability: CapabilityClass, events: Vec<TypedEvent>) -> Passport {
+        let mut log = EventLog::new(PassportId::new("urn:unidpp:passport:test-subject").unwrap());
+        for e in events {
+            log.append(e, None, None).unwrap();
+        }
+        Passport {
+            schema: unidpp_cli::passport::SCHEMA.to_string(),
+            passport_id: PassportId::new("urn:unidpp:passport:test-subject").unwrap(),
+            product_id: unidpp_model::ProductIdentifier::parse("gtin:4006381333931").unwrap(),
+            type_ref: None,
+            capability,
+            eo_id: "urn:unidpp:actor:test".to_string(),
+            resolver_uri: "https://resolver.unidpp.org/x".to_string(),
+            validity: Interval::starting(Timestamp::from_secs(0)),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            log,
+            event_signatures: Vec::new(),
+        }
+    }
+
+    /// A rich passport: an attested milestone (score, capacity), an
+    /// unsigned correction (weak fact), a self-declared correction.
+    fn rich_passport() -> Passport {
+        passport_with(
+            CapabilityClass::PassiveAuth,
+            vec![
+                event(
+                    0,
+                    EventPayload::MilestoneRecord {
+                        counters: [
+                            ("score".to_string(), "8.1".parse().unwrap()),
+                            ("capacity-kwh".to_string(), "5".parse().unwrap()),
+                            ("low-grade".to_string(), "3.9".parse().unwrap()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                    TrustMarker::Attested,
+                ),
+                event(
+                    1,
+                    EventPayload::Correction {
+                        field: "weak".into(),
+                        prior_value: String::new(),
+                        new_value: "weak-value".into(),
+                        reason: "unsigned declaration".into(),
+                    },
+                    TrustMarker::Unsigned,
+                ),
+            ],
+        )
+    }
+
+    fn lens_with(
+        bindings: Vec<DataPointBinding>,
+        transforms: Vec<TransformBinding>,
+    ) -> LensManifest {
+        let lens = LensManifest {
+            version: "1.0.0".into(),
+            profile: ProfileManifest {
+                id: unidpp_model::ProfileId::new("urn:unidpp:profile:test").unwrap(),
+                axes: ProfileAxes::jurisdiction("EU"),
+                trigger: TriggerPredicate::Any,
+                min_capability: CapabilityClass::Silent,
+                freshness: FreshnessRequirement::Static,
+                effective: Interval::starting(Timestamp::from_secs(0)),
+                data_points: bindings.iter().map(|b| data_point_of(&b.element)).collect(),
+                crypto_suites: vec![SignatureSuite::EcdsaP256],
+                confidential: false,
+                resolution: Resolution::Public,
+                edge_visibility: VisibilityClass::Public,
+                traversal: Traversal::Public,
+            },
+            bindings,
+            transforms,
+        };
+        lens
+    }
+
+    /// The data-point reference whose canonical string is `element`
+    /// (`register/item@version`).
+    fn data_point_of(element: &str) -> DataPointRef {
+        let (reg_item, version) = element.rsplit_once('@').expect("element carries @version");
+        let (register, item) = reg_item.split_once('/').expect("element carries register/");
+        DataPointRef {
+            register: register.to_string(),
+            item: item.to_string(),
+            version: Some(version.to_string()),
+        }
+    }
+
+    fn binding(element: &str, source: &str) -> DataPointBinding {
+        DataPointBinding {
+            element: element.into(),
+            source: source.into(),
+            min_trust: TrustMarker::Unsigned,
+            min_capability: CapabilityClass::Silent,
+            declared_unit: None,
+        }
+    }
+
+    fn render(passport: &Passport, lens: &LensManifest) -> Value {
+        project(
+            passport,
+            lens,
+            at(),
+            "market-surveillance-authority",
+            &BTreeMap::new(),
+            &ProfileSource::registry(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn selection_binds_elements_to_facts_with_provenance() {
+        let lens = lens_with(vec![binding("ferin:eu/score@1", "score")], vec![]);
+        let view = render(&rich_passport(), &lens);
+        let selected = view["selected"].as_array().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0]["element"], json!("ferin:eu/score@1"));
+        assert_eq!(selected[0]["value"], json!("8.1"));
+        assert_eq!(selected[0]["kind"], json!("num"));
+        assert_eq!(selected[0]["sourced"]["seq"], json!(0));
+        assert_eq!(selected[0]["trust"], json!("attested"));
+        // The trust map carries the marker per element.
+        assert_eq!(view["trust"]["ferin:eu/score@1"], json!("attested"));
+        assert_eq!(view["actor"], json!("market-surveillance-authority"));
+    }
+
+    #[test]
+    fn absent_elements_are_missing_with_reason() {
+        let lens = lens_with(
+            vec![
+                binding("ferin:eu/score@1", "score"),
+                binding("ferin:eu/ghost@1", "ghost"),
+            ],
+            vec![],
+        );
+        let view = render(&rich_passport(), &lens);
+        assert_eq!(view["coverage"]["elements_required"], json!(2));
+        assert_eq!(view["coverage"]["elements_present"], json!(1));
+        let missing = view["coverage"]["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0]["element"], json!("ferin:eu/ghost@1"));
+        assert_eq!(missing[0]["reason"], json!("absent-as-of"));
+        assert!(!view["coverage"]["complete"].as_bool().unwrap());
+        // 1 of 2.
+        assert!((view["coverage"]["ratio"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provenance_floor_blocks_below_grade_facts() {
+        let mut b = binding("ferin:eu/weak@1", "weak");
+        b.min_trust = TrustMarker::SelfDeclared;
+        let lens = lens_with(vec![b], vec![]);
+        let view = render(&rich_passport(), &lens);
+        let missing = view["coverage"]["missing"].as_array().unwrap();
+        assert_eq!(missing[0]["reason"], json!("below-trust-floor"));
+        assert_eq!(missing[0]["floor"], json!("self-declared"));
+        assert_eq!(view["selected"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn capability_gate_blocks_below_class_subjects() {
+        let mut b = binding("ferin:eu/score@1", "score");
+        b.min_capability = CapabilityClass::Connected;
+        let lens = lens_with(vec![b], vec![]);
+        // The rich passport is S1; the gate demands S3.
+        let view = render(&rich_passport(), &lens);
+        let missing = view["coverage"]["missing"].as_array().unwrap();
+        assert_eq!(missing[0]["reason"], json!("capability-gate"));
+        assert_eq!(missing[0]["floor"], json!("connected"));
+    }
+
+    #[test]
+    fn unit_conversion_is_exact_kwh_to_mj() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::UnitConversion {
+                id: "mj".into(),
+                source: "capacity-kwh".into(),
+                from_unit: "kWh".into(),
+                to_unit: "MJ".into(),
+                from_item: None,
+                to_item: None,
+            }],
+        );
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        assert_eq!(t["status"], json!("computed"));
+        assert_eq!(t["output"]["amount"], json!("18")); // 5 kWh = 18 MJ exactly
+        assert_eq!(t["output"]["unit"], json!("MJ"));
+        assert_eq!(t["input"]["amount"], json!("5"));
+        assert_eq!(t["exact"], json!(true));
+        assert_eq!(t["trust"], json!("attested"));
+    }
+
+    #[test]
+    fn unit_conversion_dimension_mismatch_fails_visibly() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::UnitConversion {
+                id: "nonsense".into(),
+                source: "capacity-kwh".into(),
+                from_unit: "kWh".into(),
+                to_unit: "kg".into(),
+                from_item: None,
+                to_item: None,
+            }],
+        );
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        assert_eq!(t["status"], json!("failed"));
+        assert!(t["error"].as_str().unwrap().contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn classification_bands_and_unclassified() {
+        let class_of = |value_source: &str, bands: Vec<ClassBand>| {
+            let lens = lens_with(
+                vec![binding("ferin:eu/score@1", "score")],
+                vec![TransformBinding::Classification {
+                    id: "cl".into(),
+                    source: value_source.into(),
+                    bands,
+                }],
+            );
+            let view = render(&rich_passport(), &lens);
+            (
+                view["transformed"][0]["output"].clone(),
+                view["transformed"][0]["status"].clone(),
+            )
+        };
+        let eu_bands = |min: &str| ClassBand {
+            label: "pass".into(),
+            min: min.parse().unwrap(),
+        };
+        // 8.1 >= 8.0 -> pass.
+        assert_eq!(class_of("score", vec![eu_bands("8.0")]).0, json!("pass"));
+        // 3.9 < 4.0 -> unclassified (explicit, never silent).
+        assert_eq!(
+            class_of("low-grade", vec![eu_bands("4.0")]).0,
+            json!("unclassified")
+        );
+        // The highest matching band wins regardless of declaration order.
+        let bands = vec![eu_bands("6.0"), eu_bands("8.0")];
+        assert_eq!(class_of("score", bands.clone()).0, json!("pass"));
+    }
+
+    #[test]
+    fn classification_of_non_numeric_fact_fails() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::Classification {
+                id: "cl".into(),
+                source: "weak".into(),
+                bands: vec![ClassBand {
+                    label: "x".into(),
+                    min: "1".parse().unwrap(),
+                }],
+            }],
+        );
+        let view = render(&rich_passport(), &lens);
+        assert_eq!(view["transformed"][0]["status"], json!("failed"));
+    }
+
+    #[test]
+    fn transform_with_absent_source_fails_and_states_the_instant() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::Classification {
+                id: "cl".into(),
+                source: "ghost".into(),
+                bands: vec![ClassBand {
+                    label: "x".into(),
+                    min: "0".parse().unwrap(),
+                }],
+            }],
+        );
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        assert_eq!(t["status"], json!("failed"));
+        let error = t["error"].as_str().unwrap();
+        assert!(
+            error.contains("ghost") && error.contains("absent as-of"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unresolvable_unit_items_are_reported_not_invented() {
+        let lens = lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::UnitConversion {
+                id: "mj".into(),
+                source: "capacity-kwh".into(),
+                from_unit: "kWh".into(),
+                to_unit: "MJ".into(),
+                from_item: Some("unit-kwh".into()),
+                to_item: None,
+            }],
+        );
+        let view = render(&rich_passport(), &lens);
+        let units = &view["transformed"][0]["units"];
+        assert_eq!(units["kWh"]["uom_registered"], json!(false));
+        assert_eq!(units["kWh"]["item"], json!("unit-kwh"));
+        // The conversion is still exact (local seed).
+        assert_eq!(view["transformed"][0]["output"]["amount"], json!("18"));
+    }
+
+    #[test]
+    fn declared_unit_travels_with_selected_elements() {
+        let mut b = binding("ferin:eu/cap@1", "capacity-kwh");
+        b.declared_unit = Some("kWh".into());
+        let lens = lens_with(vec![b], vec![]);
+        let view = render(&rich_passport(), &lens);
+        assert_eq!(view["selected"][0]["declared_unit"], json!("kWh"));
+    }
+
+    #[test]
+    fn passport_block_carries_status_and_validity() {
+        let lens = lens_with(vec![binding("ferin:eu/score@1", "score")], vec![]);
+        let view = render(&rich_passport(), &lens);
+        assert_eq!(view["passport"]["capability"], json!("passive-auth"));
+        assert_eq!(view["passport"]["status"], json!("issued"));
+        assert_eq!(view["passport"]["events"], json!(2));
+        assert_eq!(view["passport"]["validity"]["contains_as_of"], json!(true));
+        assert!(view["passport"]["log_head"].as_str().unwrap().len() >= 16);
+        assert_eq!(view["as_of"], json!(at().to_string()));
+        assert_eq!(view["profile"]["source"], json!("registry"));
+    }
+
+    #[test]
+    fn fact_values_render_as_plain_json() {
+        let mut events = vec![event(
+            0,
+            EventPayload::Correction {
+                field: "flag".into(),
+                prior_value: String::new(),
+                new_value: "true".into(),
+                reason: "test".into(),
+            },
+            TrustMarker::Attested,
+        )];
+        events.push(event(
+            1,
+            EventPayload::Correction {
+                field: "list".into(),
+                prior_value: String::new(),
+                new_value: "a,b".into(),
+                reason: "test".into(),
+            },
+            TrustMarker::Attested,
+        ));
+        let passport = passport_with(CapabilityClass::Silent, events);
+        let lens = lens_with(
+            vec![
+                binding("ferin:eu/flag@1", "flag"),
+                binding("ferin:eu/list@1", "list"),
+            ],
+            vec![],
+        );
+        let view = render(&passport, &lens);
+        let selected = view["selected"].as_array().unwrap();
+        assert_eq!(selected[0]["value"], json!(true));
+        assert_eq!(selected[0]["kind"], json!("bool"));
+        assert_eq!(selected[1]["value"], json!("a,b"));
+    }
+
+    #[test]
+    fn invalid_lens_is_refused() {
+        let mut lens = lens_with(vec![binding("ferin:eu/score@1", "score")], vec![]);
+        lens.bindings.clear();
+        assert!(matches!(
+            project(
+                &rich_passport(),
+                &lens,
+                at(),
+                "customs",
+                &BTreeMap::new(),
+                &ProfileSource::registry(),
+            ),
+            Err(ViewError::Invalid(_))
+        ));
+    }
+}
