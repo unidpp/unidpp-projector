@@ -36,7 +36,9 @@ fn scratch_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// A registry seeded with the two lenses and the energy units.
+/// A registry seeded with the two lenses, the energy units, and the
+/// Primmel battery decision-rule package (the JP lens's guard-band
+/// binding consumes it).
 async fn seeded_registry() -> RegistryServer {
     let registry = RegistryServer::spawn(RegistryConfig::default())
         .await
@@ -65,7 +67,24 @@ async fn seeded_registry() -> RegistryServer {
         "ISO 80000-4:2006 (energy)",
     )
     .await;
+    register_primmel_package(&registry).await;
     registry
+}
+
+/// Register the fixture Primmel package as a transform item (the
+/// I8 deterministic registered transforms channel: the item's
+/// manifest is the `.prml` package JSON).
+async fn register_primmel_package(registry: &RegistryServer) {
+    let body = json!({
+        "register_id": "unidpp-seed",
+        "item_id": fixtures::BATTERY_RULES_PACKAGE_ID,
+        "class": "transform",
+        "definition": "Primmel battery decision rules (guard band w=U, efficiency classes)",
+        "version": "1.0.0",
+        "manifest": serde_json::to_value(fixtures::battery_rules_package()).unwrap()
+    });
+    let (status, text) = post_json(&format!("{}/transforms", registry.base_url), &body).await;
+    assert_eq!(status, 201, "primmel package registration failed: {text}");
 }
 
 async fn post_json(url: &str, body: &Value) -> (u16, String) {
@@ -581,6 +600,182 @@ async fn fixture_mode_serves_the_demo_passport() {
     assert_eq!(eu["passport"]["source"], json!("fixture"));
     assert_eq!(eu["profile"]["source"], json!("fixtures"));
     assert_eq!(eu["coverage"]["elements_present"], json!(3));
+    projector.stop().await;
+}
+
+#[tokio::test]
+async fn primmel_rules_carry_clause_urn_provenance() {
+    let registry = seeded_registry().await;
+    let (projector, _dir) = wired_projector(Some(registry.base_url.clone())).await;
+
+    // --- the JP guard band: decision with its legal paragraph ------
+    let (status, jp, _) = get_view(
+        &projector.base_url,
+        DEMO_PASSPORT,
+        JP_LENS,
+        "customs",
+        Some(DEMO_AT),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", jp);
+    let guard = transformed(&jp, "jp-soh-guard-band");
+    assert_eq!(guard["kind"], json!("primmel"));
+    assert_eq!(guard["status"], json!("computed"));
+    // SoH 86.3 >= 85 bare, but 86.3 - 1.8 = 84.5 < 85 under w = U.
+    assert_eq!(guard["output"], json!("not-demonstrably-conforming"));
+    assert_eq!(guard["matched_arm"], json!(1));
+    assert_eq!(
+        guard["clause_urn"],
+        json!("urn:oiml:pub:r:91-2:2025#clause-6.1")
+    );
+    assert_eq!(
+        guard["package"]["id"],
+        json!(fixtures::BATTERY_RULES_PACKAGE_ID)
+    );
+    assert_eq!(guard["package"]["version"], json!("1.0.0"));
+    // Served by the registry's transform subregister, and it says so.
+    assert_eq!(guard["package"]["source"], json!("registry"));
+    assert_eq!(guard["rule_id"], json!("soh-guard-band"));
+    assert_eq!(
+        guard["inputs"]["soh"],
+        json!({
+            "path": "battery.soh-pct", "value": "86.3",
+            "trust": "attested", "sourced_seq": 6
+        })
+    );
+    assert_eq!(guard["inputs"]["U"]["value"], json!("1.8"));
+    assert_eq!(guard["trust"], json!("attested"));
+
+    // --- the EU efficiency class: same package, other rule ---------
+    let (status, eu, _) = get_view(
+        &projector.base_url,
+        DEMO_PASSPORT,
+        EU_LENS,
+        "customs",
+        Some(DEMO_AT),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let eff = transformed(&eu, "eu-efficiency-class");
+    assert_eq!(eff["status"], json!("computed"));
+    assert_eq!(eff["output"], json!("B"));
+    assert_eq!(eff["matched_arm"], json!(1));
+    assert_eq!(eff["clause_urn"], json!("urn:eu:reg:2017:1369#annex-ii"));
+    assert_eq!(eff["package"]["source"], json!("registry"));
+
+    // --- before the milestone: a coverage gap, not an error --------
+    let (status, early, _) = get_view(
+        &projector.base_url,
+        DEMO_PASSPORT,
+        JP_LENS,
+        "customs",
+        Some("2026-12-15T00:00:00Z"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let guard = transformed(&early, "jp-soh-guard-band");
+    assert_eq!(guard["status"], json!("missing-inputs"));
+    assert_eq!(
+        guard["clause_urn"],
+        json!("urn:oiml:pub:r:91-2:2025#clause-6.1")
+    );
+    let missing = guard["missing_inputs"].as_array().unwrap();
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().all(|m| m["reason"] == json!("absent-as-of")));
+    assert!(guard.get("output").is_none());
+
+    projector.stop().await;
+    registry.stop().await;
+}
+
+#[tokio::test]
+async fn primmel_package_resolution_is_honest_about_its_sources() {
+    // A registry WITHOUT the package item: the live negative stands —
+    // the binding reports the package as unavailable, never a silent
+    // fixture invention.
+    let registry = RegistryServer::spawn(RegistryConfig::default())
+        .await
+        .expect("registry spawns");
+    register_lens(
+        &registry,
+        fixtures::jp_lens().registration_body("ferin:jp", "JP METI PSE lens"),
+    )
+    .await;
+    let (projector, _dir) = wired_projector(Some(registry.base_url.clone())).await;
+    let (status, jp, _) = get_view(
+        &projector.base_url,
+        DEMO_PASSPORT,
+        JP_LENS,
+        "customs",
+        Some(DEMO_AT),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", jp);
+    let guard = transformed(&jp, "jp-soh-guard-band");
+    assert_eq!(guard["status"], json!("failed"));
+    let error = guard["error"].as_str().unwrap();
+    assert!(
+        error.contains("not available") && error.contains(fixtures::BATTERY_RULES_PACKAGE_ID),
+        "{error}"
+    );
+    // The rest of the view is unaffected (the lens itself was served).
+    assert_eq!(jp["profile"]["source"], json!("registry"));
+    assert_eq!(
+        transformed(&jp, "jp-reparability-class")["output"],
+        json!("class-2")
+    );
+    projector.stop().await;
+    registry.stop().await;
+
+    // No registry at all: the built-in fixtures serve the package and
+    // the transform says which source it came from.
+    let (projector, _dir) = wired_projector(None).await;
+    let (status, jp, _) = get_view(
+        &projector.base_url,
+        DEMO_PASSPORT,
+        JP_LENS,
+        "customs",
+        Some(DEMO_AT),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let guard = transformed(&jp, "jp-soh-guard-band");
+    assert_eq!(guard["status"], json!("computed"));
+    assert_eq!(guard["package"]["source"], json!("fixtures"));
+    assert_eq!(
+        guard["clause_urn"],
+        json!("urn:oiml:pub:r:91-2:2025#clause-6.1")
+    );
+
+    // An operator-pinned directory wins over both: a locally patched
+    // package (new version pin) is what evaluates.
+    let dir = scratch_dir("primmel");
+    let mut pinned = fixtures::battery_rules_package();
+    pinned.version = "1.0.1-local".to_string();
+    std::fs::write(
+        dir.join("battery.prml"),
+        serde_json::to_string_pretty(&pinned).unwrap(),
+    )
+    .expect("pinned package writes");
+    let projector = TestServer::spawn(Config {
+        primmel_dir: Some(dir.clone()),
+        ..Config::default()
+    })
+    .await
+    .expect("projector spawns");
+    let (status, jp, _) = get_view(
+        &projector.base_url,
+        DEMO_PASSPORT,
+        JP_LENS,
+        "customs",
+        Some(DEMO_AT),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", jp);
+    let guard = transformed(&jp, "jp-soh-guard-band");
+    assert_eq!(guard["package"]["source"], json!("dir"));
+    assert_eq!(guard["package"]["version"], json!("1.0.1-local"));
+    assert_eq!(guard["output"], json!("not-demonstrably-conforming"));
     projector.stop().await;
 }
 

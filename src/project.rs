@@ -21,9 +21,12 @@
 //! kWh -> MJ is x 3.6 exactly; band classification from the
 //! manifest's own table), and every derived value carries the trust
 //! marker of its input — a derived value is never more trustworthy
-//! than what it was computed from.
+//! than what it was computed from. Primmel decision-rule transforms
+//! (TODO.impl C9) evaluate their package's rule deterministically over
+//! the bound twin facts and carry the rule's `clause_urn` — the legal
+//! paragraph the decision implements — in the output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -33,6 +36,7 @@ use unidpp_transform::quantity::{Quantity, UnitRegistry};
 use unidpp_verdict::CoverageReport;
 
 use crate::lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
+use crate::primmel::{EvalError, PackageSet};
 use crate::twin::{self, SourcedFact};
 
 /// Why an element is missing from a view.
@@ -123,7 +127,8 @@ impl std::error::Error for ViewError {}
 /// authenticated — identity is the issuer's concern); `units` maps
 /// registry unit item ids to their resolved identities (absent when
 /// the registry could not serve them); `source` reports where the
-/// manifest came from.
+/// manifest came from; `packages` holds the Primmel packages the
+/// lens's rule bindings may consult (empty when the lens has none).
 pub fn project(
     passport: &Passport,
     lens: &LensManifest,
@@ -131,6 +136,7 @@ pub fn project(
     actor: &str,
     units: &BTreeMap<String, RegisteredUnit>,
     source: &ProfileSource,
+    packages: &PackageSet,
 ) -> Result<Value, ViewError> {
     lens.validate().map_err(ViewError::Invalid)?;
     let state = twin::fold(passport, at);
@@ -162,11 +168,18 @@ pub fn project(
     let unit_registry = UnitRegistry::iso80000();
     let mut transformed: Vec<Value> = Vec::new();
     for binding in &lens.transforms {
-        transformed.push(transform_json(binding, &state, &unit_registry, units, at));
+        transformed.push(transform_json(
+            binding,
+            &state,
+            &unit_registry,
+            units,
+            at,
+            packages,
+        ));
     }
 
     // --- coverage (reusing the verdict crate's report) ------------------
-    let provided_set: std::collections::BTreeSet<String> = provided.iter().cloned().collect();
+    let provided_set: BTreeSet<String> = provided.iter().cloned().collect();
     let report = CoverageReport::from_profile(&lens.profile, &provided_set);
     let missing_json: Vec<Value> = missing
         .iter()
@@ -326,15 +339,41 @@ fn transform_json(
     unit_registry: &UnitRegistry,
     units: &BTreeMap<String, RegisteredUnit>,
     at: Timestamp,
+    packages: &PackageSet,
 ) -> Value {
     let mut m = Map::new();
     m.insert("id".into(), json!(binding.id()));
     let kind = match binding {
         TransformBinding::UnitConversion { .. } => "unit-conversion",
         TransformBinding::Classification { .. } => "classification",
+        TransformBinding::Primmel { .. } => "primmel",
     };
     m.insert("kind".into(), json!(kind));
     m.insert("source".into(), json!(binding.source()));
+    if let TransformBinding::Primmel {
+        package_ref,
+        rule_id,
+        inputs,
+        ..
+    } = binding
+    {
+        // Primmel rules own their JSON shape: inputs, decision,
+        // provenance. (The generic input/trust fields below are
+        // covered by the per-input block this branch emits.)
+        m.insert("package_ref".into(), json!(package_ref));
+        m.insert("rule_id".into(), json!(rule_id));
+        // The full set of fact paths this rule consumes (deterministic
+        // input-name order), not just the first one.
+        let paths: Vec<&str> = inputs.values().map(String::as_str).collect();
+        m.insert("source".into(), json!(paths.join(",")));
+        let entry = primmel_json(package_ref, rule_id, inputs, state, packages, at);
+        if let Value::Object(fields) = entry {
+            for (k, v) in fields {
+                m.insert(k, v);
+            }
+        }
+        return Value::Object(m);
+    }
     let fact = state.get(binding.source());
     let computed: Option<Value> = match binding {
         TransformBinding::UnitConversion {
@@ -375,6 +414,8 @@ fn transform_json(
                 _ => None,
             })
         }
+        // Primmel bindings render their own entry (early return above).
+        TransformBinding::Primmel { .. } => None,
     };
     // The input travels with the transform whatever happens (so a
     // failed transform still states what it was asked to compute).
@@ -405,10 +446,165 @@ fn transform_json(
                     TransformBinding::Classification { .. } => {
                         "classification source is not a numeric fact".to_string()
                     }
+                    TransformBinding::Primmel { .. } => "primmel rule could not run".to_string(),
                 }
             };
             m.insert("status".into(), json!("failed"));
             m.insert("error".into(), json!(error));
+        }
+    }
+    Value::Object(m)
+}
+
+/// Evaluate one Primmel rule binding and render its transform entry:
+/// the decision label, the rule's clause-URN provenance (the legal
+/// paragraph it implements), the resolved inputs with their values and
+/// trust, and the package identity. Failure paths follow the honesty
+/// doctrine: absent inputs are a *coverage* gap (`missing-inputs`,
+/// per-input reasons); a package the projector does not hold, a rule
+/// the package lacks, or a non-numeric input is a failure with its
+/// reason — never a guessed label.
+#[allow(clippy::too_many_arguments)]
+fn primmel_json(
+    package_ref: &str,
+    rule_id: &str,
+    inputs: &BTreeMap<String, String>,
+    state: &twin::TwinState,
+    packages: &PackageSet,
+    at: Timestamp,
+) -> Value {
+    let mut m = Map::new();
+    let Some((package, package_source)) = packages.get(package_ref) else {
+        m.insert("status".into(), json!("failed"));
+        m.insert(
+            "error".into(),
+            json!(format!(
+                "primmel package `{package_ref}` is not available to this \
+                 projector (rule `{rule_id}` cannot run)"
+            )),
+        );
+        return Value::Object(m);
+    };
+    let mut package_block = Map::new();
+    package_block.insert("id".into(), json!(package.id));
+    package_block.insert("version".into(), json!(package.version));
+    package_block.insert("source".into(), json!(package_source));
+    m.insert("package".into(), Value::Object(package_block));
+    let Some(rule) = package.rule(rule_id) else {
+        m.insert("status".into(), json!("failed"));
+        m.insert(
+            "error".into(),
+            json!(format!(
+                "primmel package `{package_ref}` has no rule `{rule_id}` \
+                 (it holds: {})",
+                package
+                    .rules
+                    .iter()
+                    .map(|r| r.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
+        return Value::Object(m);
+    };
+
+    // Resolve the rule's named inputs against the twin state: each
+    // binding maps a rule input name to a fact path. A missing input
+    // is reported per input — coverage, not error.
+    let mut values: BTreeMap<String, Decimal> = BTreeMap::new();
+    let mut input_block = Map::new();
+    let mut missing_inputs: Vec<Value> = Vec::new();
+    let mut weakest_trust: Option<TrustMarker> = None;
+    for (name, path) in inputs {
+        let mut entry = Map::new();
+        entry.insert("path".into(), json!(path));
+        match state.get(path) {
+            None => {
+                missing_inputs.push(json!({
+                    "input": name,
+                    "path": path,
+                    "reason": "absent-as-of",
+                    "detail": format!(
+                        "no event wrote fact `{path}` at or before the \
+                         as-of instant {at}"
+                    ),
+                }));
+            }
+            Some(fact) => match &fact.value {
+                FactValue::Num(v) => {
+                    values.insert(name.clone(), *v);
+                    entry.insert("value".into(), json!(v.to_string()));
+                    entry.insert("trust".into(), json!(fact.origin.trust.to_string()));
+                    entry.insert("sourced_seq".into(), json!(fact.origin.seq));
+                    weakest_trust = Some(match weakest_trust {
+                        None => fact.origin.trust,
+                        // The derived decision is never more
+                        // trustworthy than its weakest input.
+                        Some(floor) if fact.origin.trust.grade() < floor.grade() => {
+                            fact.origin.trust
+                        }
+                        Some(floor) => floor,
+                    });
+                }
+                other => {
+                    missing_inputs.push(json!({
+                        "input": name,
+                        "path": path,
+                        "reason": "not-numeric",
+                        "detail": format!(
+                            "fact `{path}` is a {} fact; the rule needs a \
+                             numeric measurand",
+                            other.type_name()
+                        ),
+                    }));
+                }
+            },
+        }
+        input_block.insert(name.clone(), Value::Object(entry));
+    }
+    m.insert("inputs".into(), Value::Object(input_block));
+
+    if !missing_inputs.is_empty() {
+        // The rule's paragraph stands even when the facts do not: the
+        // clause URN is emitted with the coverage gap.
+        m.insert("clause_urn".into(), json!(rule.clause_urn));
+        m.insert("status".into(), json!("missing-inputs"));
+        m.insert("missing_inputs".into(), Value::Array(missing_inputs));
+        return Value::Object(m);
+    }
+    match rule.evaluate(&values) {
+        Ok(outcome) => {
+            m.insert("clause_urn".into(), json!(rule.clause_urn));
+            m.insert("output".into(), json!(outcome.label));
+            if let Some(arm) = outcome.matched_arm {
+                m.insert("matched_arm".into(), json!(arm));
+            } else {
+                m.insert("matched_arm".into(), Value::Null);
+            }
+            if let Some(t) = weakest_trust {
+                m.insert("trust".into(), json!(t.to_string()));
+            }
+            m.insert("status".into(), json!("computed"));
+        }
+        Err(EvalError::MissingInput { input }) => {
+            // The binding did not map every input the rule names.
+            m.insert("status".into(), json!("missing-inputs"));
+            m.insert(
+                "missing_inputs".into(),
+                json!([{
+                    "input": input,
+                    "path": inputs.get(&input).map(String::as_str).unwrap_or(""),
+                    "reason": "not-bound",
+                    "detail": format!(
+                        "rule `{rule_id}` consumes input `{input}`, which \
+                         the binding does not map to a twin fact path"
+                    ),
+                }]),
+            );
+        }
+        Err(e) => {
+            m.insert("status".into(), json!("failed"));
+            m.insert("error".into(), json!(format!("rule `{rule_id}`: {e}")));
         }
     }
     Value::Object(m)
@@ -602,6 +798,10 @@ mod tests {
     }
 
     fn render(passport: &Passport, lens: &LensManifest) -> Value {
+        render_with(passport, lens, &crate::fixtures::fixture_primmel())
+    }
+
+    fn render_with(passport: &Passport, lens: &LensManifest, packages: &PackageSet) -> Value {
         project(
             passport,
             lens,
@@ -609,8 +809,208 @@ mod tests {
             "market-surveillance-authority",
             &BTreeMap::new(),
             &ProfileSource::registry(),
+            packages,
         )
         .unwrap()
+    }
+
+    /// A one-binding lens with the fixture Primmel package available
+    /// (the guard-band rule of the demo corpus).
+    fn primmel_lens(package_ref: &str, rule_id: &str, inputs: Vec<(&str, &str)>) -> LensManifest {
+        lens_with(
+            vec![binding("ferin:eu/score@1", "score")],
+            vec![TransformBinding::Primmel {
+                id: "rule".into(),
+                package_ref: package_ref.into(),
+                rule_id: rule_id.into(),
+                inputs: inputs
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }],
+        )
+    }
+
+    #[test]
+    fn primmel_rule_evaluates_with_clause_urn_provenance() {
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "soh-guard-band",
+            vec![("soh", "score"), ("U", "capacity-kwh")],
+        );
+        // score 8.1 - capacity 5 = 3.1 < 85: the else arm — the
+        // decision, its arm, and the paragraph it implements.
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        assert_eq!(t["kind"], json!("primmel"));
+        assert_eq!(t["status"], json!("computed"));
+        assert_eq!(t["output"], json!("not-demonstrably-conforming"));
+        assert_eq!(t["matched_arm"], json!(1));
+        assert_eq!(
+            t["clause_urn"],
+            json!("urn:oiml:pub:r:91-2:2025#clause-6.1")
+        );
+        assert_eq!(t["package"]["id"], json!("urn:primmel:pkg:battery-rules"));
+        assert_eq!(t["package"]["version"], json!("1.0.0"));
+        assert_eq!(t["package"]["source"], json!("fixtures"));
+        assert_eq!(t["rule_id"], json!("soh-guard-band"));
+        assert_eq!(t["inputs"]["soh"]["value"], json!("8.1"));
+        assert_eq!(t["inputs"]["soh"]["trust"], json!("attested"));
+        // Both inputs are attested: the decision inherits that marker.
+        assert_eq!(t["trust"], json!("attested"));
+    }
+
+    #[test]
+    fn primmel_decision_carries_the_weakest_input_trust() {
+        // A passport whose SoH comes from an attested milestone and
+        // whose uncertainty from a self-declared correction: the
+        // decision is never more trustworthy than its weakest input.
+        let passport = passport_with(
+            CapabilityClass::PassiveAuth,
+            vec![
+                event(
+                    0,
+                    EventPayload::MilestoneRecord {
+                        counters: [("soh".to_string(), "90.5".parse().unwrap())]
+                            .into_iter()
+                            .collect(),
+                    },
+                    TrustMarker::Attested,
+                ),
+                event(
+                    1,
+                    EventPayload::Correction {
+                        field: "soh-u".into(),
+                        prior_value: String::new(),
+                        new_value: "0.5".into(),
+                        reason: "declared uncertainty".into(),
+                    },
+                    TrustMarker::SelfDeclared,
+                ),
+            ],
+        );
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "soh-guard-band",
+            vec![("soh", "soh"), ("U", "soh-u")],
+        );
+        let view = render(&passport, &lens);
+        let t = &view["transformed"][0];
+        // 90.5 - 0.5 = 90 >= 85: conforming, but graded self-declared.
+        assert_eq!(t["output"], json!("conforming"));
+        assert_eq!(t["inputs"]["soh"]["trust"], json!("attested"));
+        assert_eq!(t["inputs"]["U"]["trust"], json!("self-declared"));
+        assert_eq!(t["trust"], json!("self-declared"));
+    }
+
+    #[test]
+    fn primmel_with_absent_input_reports_missing_coverage_not_error() {
+        // The rule's inputs do not exist as-of the instant (and one
+        // resolves to a string fact): a coverage gap with per-input
+        // reasons, never a crash and never a guessed label.
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "soh-guard-band",
+            vec![("soh", "ghost"), ("U", "weak")],
+        );
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        assert_eq!(t["status"], json!("missing-inputs"));
+        assert_eq!(
+            t["clause_urn"],
+            json!("urn:oiml:pub:r:91-2:2025#clause-6.1")
+        );
+        let missing = t["missing_inputs"].as_array().unwrap();
+        assert_eq!(missing.len(), 2);
+        // Input names resolve by identity (map order is by input
+        // name, not assertion order); one gap per reason.
+        let soh = missing.iter().find(|m| m["input"] == json!("soh")).unwrap();
+        assert_eq!(soh["reason"], json!("absent-as-of"));
+        assert!(soh["detail"].as_str().unwrap().contains("ghost"));
+        let u = missing.iter().find(|m| m["input"] == json!("U")).unwrap();
+        assert_eq!(u["reason"], json!("not-numeric"));
+        assert!(u["detail"].as_str().unwrap().contains("numeric measurand"));
+        assert_eq!(t["inputs"]["soh"]["path"], json!("ghost"));
+        assert!(t.get("output").is_none());
+    }
+
+    #[test]
+    fn primmel_with_unmapped_rule_input_reports_the_binding_gap() {
+        // The binding maps `U` but the rule also wants `soh`: the gap
+        // names the unmapped input.
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "soh-guard-band",
+            vec![("U", "capacity-kwh")],
+        );
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        assert_eq!(t["status"], json!("missing-inputs"));
+        let missing = t["missing_inputs"].as_array().unwrap();
+        assert_eq!(missing[0]["input"], json!("soh"));
+        assert_eq!(missing[0]["reason"], json!("not-bound"));
+    }
+
+    #[test]
+    fn primmel_with_non_numeric_input_fails_with_reason() {
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "efficiency-class",
+            vec![("eff", "weak")],
+        );
+        let view = render(&rich_passport(), &lens);
+        let t = &view["transformed"][0];
+        // A string fact is a type gap on the input, reported per
+        // input like any other missing measurand.
+        assert_eq!(t["status"], json!("missing-inputs"));
+        let missing = t["missing_inputs"].as_array().unwrap();
+        assert_eq!(missing[0]["reason"], json!("not-numeric"));
+        assert!(missing[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("numeric measurand"));
+    }
+
+    #[test]
+    fn primmel_without_the_package_or_rule_fails_honestly() {
+        // Package the projector does not hold.
+        let lens = primmel_lens(
+            "urn:primmel:pkg:nowhere",
+            "soh-guard-band",
+            vec![("soh", "score")],
+        );
+        let view = render(&rich_passport(), &lens);
+        assert_eq!(view["transformed"][0]["status"], json!("failed"));
+        assert!(view["transformed"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not available"));
+
+        // Package held, rule id not in it.
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "no-such-rule",
+            vec![("soh", "score")],
+        );
+        let view = render(&rich_passport(), &lens);
+        assert_eq!(view["transformed"][0]["status"], json!("failed"));
+        let error = view["transformed"][0]["error"].as_str().unwrap();
+        assert!(
+            error.contains("no rule") && error.contains("soh-guard-band"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn primmel_evaluation_is_deterministic() {
+        let lens = primmel_lens(
+            "urn:primmel:pkg:battery-rules",
+            "soh-guard-band",
+            vec![("soh", "score"), ("U", "capacity-kwh")],
+        );
+        let first = render(&rich_passport(), &lens);
+        let second = render(&rich_passport(), &lens);
+        assert_eq!(first["transformed"], second["transformed"]);
     }
 
     #[test]
@@ -881,6 +1281,7 @@ mod tests {
                 "customs",
                 &BTreeMap::new(),
                 &ProfileSource::registry(),
+                &PackageSet::empty(),
             ),
             Err(ViewError::Invalid(_))
         ));

@@ -27,6 +27,10 @@ pub mod subregister {
     pub const PROFILES: &str = "profiles";
     /// Unit items (registered unit identity).
     pub const UNITS: &str = "units";
+    /// Transform items (registered Primmel packages: I8 deterministic
+    /// registered transforms — the item's manifest is the package
+    /// JSON).
+    pub const TRANSFORMS: &str = "transforms";
 }
 
 /// The outcome of one registry read.

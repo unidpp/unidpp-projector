@@ -24,7 +24,11 @@
 //! manifests are fetched from the registry at `UNIDPP_REGISTRY_URL`
 //! point-in-time (`?at=` forwarded); with no registry configured, or
 //! one that is unreachable, the built-in EU/JP fixtures serve and the
-//! view says so.
+//! view says so. Primmel rule packages (`.prml`, the deterministic
+//! decision rules a lens's primmel transforms bind) resolve from the
+//! operator-pinned directory `UNIDPP_PROJECTOR_PRIMMEL_DIR` first,
+//! then the registry's transform subregister, then the built-in
+//! fixtures — the transform output states which one served.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -43,6 +47,7 @@ use unidpp_model::{Resolution, Timestamp};
 
 use crate::fixtures;
 use crate::lens::LensManifest;
+use crate::primmel::PackageSet;
 use crate::project::{project, ProfileSource, RegisteredUnit};
 use crate::registry::{subregister, FetchOutcome, RegistryClient};
 
@@ -51,8 +56,8 @@ use crate::registry::{subregister, FetchOutcome, RegistryClient};
 pub struct Config {
     /// Listen address.
     pub bind: SocketAddr,
-    /// Optional `unidpp-registry` base URL for profile and unit
-    /// reads.
+    /// Optional `unidpp-registry` base URL for profile, unit, and
+    /// primmel-package reads.
     pub registry_url: Option<String>,
     /// Bearer token sent to the registry (its admin token; reads are
     /// public, this exists for consistency with the issuer).
@@ -60,6 +65,11 @@ pub struct Config {
     /// Optional directory of `unidpp/passport@1` documents (the
     /// passport store). `None` = built-in fixture mode.
     pub passports_dir: Option<PathBuf>,
+    /// Optional directory of `.prml` Primmel packages
+    /// (`UNIDPP_PROJECTOR_PRIMMEL_DIR`): operator-pinned rule
+    /// packages, served before the registry and the built-in
+    /// fixtures. `None` = registry/fixtures mode.
+    pub primmel_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -69,6 +79,7 @@ impl Default for Config {
             registry_url: None,
             registry_token: None,
             passports_dir: None,
+            primmel_dir: None,
         }
     }
 }
@@ -98,6 +109,11 @@ impl Config {
         if let Ok(dir) = std::env::var("UNIDPP_PROJECTOR_PASSPORTS_DIR") {
             if !dir.is_empty() {
                 config.passports_dir = Some(PathBuf::from(dir));
+            }
+        }
+        if let Ok(dir) = std::env::var("UNIDPP_PROJECTOR_PRIMMEL_DIR") {
+            if !dir.is_empty() {
+                config.primmel_dir = Some(PathBuf::from(dir));
             }
         }
         config
@@ -198,7 +214,7 @@ async fn discovery() -> Result<Response, Response> {
         "view_contract": {
             "profile": {"id": "profile item id", "version": "manifest version pin", "axes": "...", "applies": "trigger + effective window at the as-of instant", "satisfiable": "capability floor vs subject", "source": "registry | fixtures | unreachable"},
             "selected": [{"element": "register/item@version", "value": "from the passport twin state", "sourced": {"seq": 0, "occurred_at": "...", "actor_role": "...", "actor_id": "..."}, "trust": "I9 marker of the sourcing event"}],
-            "transformed": [{"id": "...", "kind": "unit-conversion | classification", "input": "...", "output": "...", "trust": "marker of the input", "status": "computed | failed"}],
+            "transformed": [{"id": "...", "kind": "unit-conversion | classification | primmel", "input": "...", "output": "...", "trust": "marker of the input", "status": "computed | failed | missing-inputs"}],
             "coverage": {"elements_required": 0, "elements_present": 0, "missing": [{"element": "...", "reason": "absent-as-of | below-trust-floor | capability-gate"}], "complete": false, "ratio": 1.0},
             "as_of": "the projection instant (?at= or now)",
             "trust": {"<element>": "<marker>", "…": "marker per selected element"}
@@ -207,7 +223,8 @@ async fn discovery() -> Result<Response, Response> {
         "sources": {
             "passports": "unidpp/passport@1 documents from UNIDPP_PROJECTOR_PASSPORTS_DIR, else the built-in two-lens fixture",
             "profiles": "unidpp-registry profile items at UNIDPP_REGISTRY_URL (point-in-time with at=), else built-in EU/JP fixtures",
-            "units": "registry units subregister identity (ISO 80000 citation chain); conversions are exact through the local ISO 80000 seed"
+            "units": "registry units subregister identity (ISO 80000 citation chain); conversions are exact through the local ISO 80000 seed",
+            "primmel": ".prml rule packages from UNIDPP_PROJECTOR_PRIMMEL_DIR (operator pin), else the registry transform subregister, else built-in fixtures; each evaluated rule carries its clause_urn (the legal paragraph it implements)"
         },
         "as_of": {"query_parameter": "at", "response_header": "x-as-of"},
         "auth": "none (read-only service; the actor parameter is recorded, not authenticated)"
@@ -389,6 +406,76 @@ fn registered_unit_from_item(doc: &Value) -> Option<RegisteredUnit> {
     })
 }
 
+/// Resolve the Primmel packages the lens's rule bindings reference
+/// (TODO.impl C9), per package URN and in this order:
+///
+/// 1. the operator-pinned local directory (`.prml` files,
+///    `UNIDPP_PROJECTOR_PRIMMEL_DIR`) — an explicit pin beats the
+///    network;
+/// 2. the registry's transform subregister (the package as a
+///    registered item, manifest = the package JSON; a *live* 404
+///    leaves the binding unserved — the view says the package is not
+///    available rather than inventing one);
+/// 3. the built-in fixtures (no registry configured, or one that is
+///    unreachable — the degradation is stated per package in the
+///    transform output).
+async fn resolve_packages(app: &AppState, lens: &LensManifest) -> Result<PackageSet, Response> {
+    let mut refs: Vec<String> = Vec::new();
+    for transform in &lens.transforms {
+        for r in transform.package_refs() {
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+        }
+    }
+    if refs.is_empty() {
+        return Ok(PackageSet::empty());
+    }
+    // 1. Operator-pinned directory.
+    let pinned = match &app.config.primmel_dir {
+        Some(dir) => Some(PackageSet::from_dir(dir).map_err(|e| internal_error(&e))?),
+        None => None,
+    };
+    let fallback = fixtures::fixture_primmel();
+    let mut set = PackageSet::empty();
+    for r in refs {
+        if let Some((package, _)) = pinned.as_ref().and_then(|p| p.get(&r)) {
+            set.insert(package.clone(), "dir");
+            continue;
+        }
+        // 2. Registry / 3. fixtures — per the doctrine above.
+        match app
+            .registry
+            .fetch_item(subregister::TRANSFORMS, &r, None)
+            .await
+        {
+            Ok(FetchOutcome::Registry(doc)) => {
+                let manifest = doc.get("manifest").cloned().ok_or_else(|| {
+                    bad_gateway(&format!("primmel package item `{r}` carries no manifest"))
+                })?;
+                let package = crate::primmel::PrimmelPackage::from_json(&manifest)
+                    .map_err(|e| bad_gateway(&format!("primmel package item `{r}`: {e}")))?;
+                set.insert(package, "registry");
+            }
+            Ok(FetchOutcome::Missing) => {
+                // A live negative stands: the binding will report the
+                // package as unavailable.
+            }
+            Ok(FetchOutcome::Fixtures) | Ok(FetchOutcome::Unreachable(_)) => {
+                if let Some((package, _)) = fallback.get(&r) {
+                    set.insert(package.clone(), "fixtures");
+                }
+            }
+            Err(e) => {
+                return Err(bad_gateway(&format!(
+                    "registry read of primmel package `{r}` failed: {e}"
+                )))
+            }
+        }
+    }
+    Ok(set)
+}
+
 /// GET /view — the projection.
 async fn view(
     State(app): State<Arc<AppState>>,
@@ -421,7 +508,10 @@ async fn view(
     // 3. Unit identities for the transforms.
     let units = resolve_units(&app, &resolved.lens).await;
 
-    // 4. Project.
+    // 4. Primmel packages for the rule bindings.
+    let packages = resolve_packages(&app, &resolved.lens).await?;
+
+    // 5. Project.
     let mut doc = project(
         &passport,
         &resolved.lens,
@@ -429,6 +519,7 @@ async fn view(
         &query.actor,
         &units,
         &resolved.source,
+        &packages,
     )
     .map_err(|e| internal_error(&e.to_string()))?;
     if let Some(block) = doc.pointer_mut("/passport").and_then(Value::as_object_mut) {
@@ -692,6 +783,7 @@ mod tests {
         let passport = crate::fixtures::demo_passport();
         let at = demo_as_of();
         let units = crate::fixtures::fixture_units();
+        let packages = crate::fixtures::fixture_primmel();
         let source = ProfileSource::fallback("fixtures", None);
         let eu = project(
             &passport,
@@ -700,6 +792,7 @@ mod tests {
             "customs",
             &units,
             &source,
+            &packages,
         )
         .unwrap();
         let jp = project(
@@ -709,6 +802,7 @@ mod tests {
             "customs",
             &units,
             &source,
+            &packages,
         )
         .unwrap();
 
@@ -750,6 +844,40 @@ mod tests {
         assert_eq!(capacity["output"]["amount"], json!("0.2592"));
         assert_eq!(capacity["output"]["unit"], json!("MJ"));
         assert_eq!(capacity["units"]["kWh"]["uom_registered"], json!(true));
+
+        // The Primmel rules: the JP guard band decides on the
+        // uncertainty-narrowed limit with its clause URN; the EU lens
+        // classifies efficiency through the same package. 86.3 >= 85
+        // but 86.3 - 1.8 = 84.5 < 85: not demonstrably conforming.
+        let guard = jp["transformed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == json!("jp-soh-guard-band"))
+            .unwrap();
+        assert_eq!(guard["kind"], json!("primmel"));
+        assert_eq!(guard["status"], json!("computed"));
+        assert_eq!(guard["output"], json!("not-demonstrably-conforming"));
+        assert_eq!(
+            guard["clause_urn"],
+            json!("urn:oiml:pub:r:91-2:2025#clause-6.1")
+        );
+        assert_eq!(guard["inputs"]["soh"]["value"], json!("86.3"));
+        assert_eq!(guard["inputs"]["U"]["value"], json!("1.8"));
+        assert_eq!(guard["package"]["source"], json!("fixtures"));
+
+        let eff = eu["transformed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == json!("eu-efficiency-class"))
+            .unwrap();
+        assert_eq!(eff["output"], json!("B")); // 88.5 >= 85, < 92
+        assert_eq!(eff["clause_urn"], json!("urn:eu:reg:2017:1369#annex-ii"));
+        assert_eq!(
+            eff["package"]["id"],
+            json!(fixtures::BATTERY_RULES_PACKAGE_ID)
+        );
     }
 
     #[test]
@@ -769,5 +897,66 @@ mod tests {
             assert!(paths.contains(path), "missing fact {path}");
         }
         assert!(!paths.contains("de.jp.top-runner-class"));
+    }
+
+    #[tokio::test]
+    async fn package_resolution_without_primmel_bindings_is_empty() {
+        // A lens with only unit/classification transforms resolves
+        // no packages (no registry round-trip for them).
+        let app = AppState::new(Config {
+            registry_url: Some("http://127.0.0.1:1".into()), // deliberately dead
+            ..Config::default()
+        });
+        let mut lens = crate::fixtures::eu_lens();
+        lens.transforms.retain(|t| t.package_refs().is_empty());
+        let set = resolve_packages(&app, &lens).await.unwrap();
+        assert_eq!(set, PackageSet::empty());
+    }
+
+    #[tokio::test]
+    async fn package_resolution_prefers_the_pinned_dir_then_fixtures() {
+        // A pinned directory package wins over everything.
+        let dir = std::env::temp_dir().join(format!(
+            "unidpp-projector-primmel-api-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut pinned = crate::fixtures::battery_rules_package();
+        pinned.version = "9.9.9-pinned".to_string();
+        std::fs::write(
+            dir.join("battery.prml"),
+            serde_json::to_string_pretty(&pinned).unwrap(),
+        )
+        .unwrap();
+        let app = AppState::new(Config {
+            primmel_dir: Some(dir.clone()),
+            registry_url: Some("http://127.0.0.1:1".into()), // dead registry
+            ..Config::default()
+        });
+        let lens = crate::fixtures::jp_lens();
+        let set = resolve_packages(&app, &lens).await.unwrap();
+        let (pkg, source) = set.get(fixtures::BATTERY_RULES_PACKAGE_ID).unwrap();
+        assert_eq!(source, "dir");
+        assert_eq!(pkg.version, "9.9.9-pinned");
+
+        // Without a dir and with an unreachable registry, the
+        // built-in fixtures serve and say so.
+        let app = AppState::new(Config::default());
+        let set = resolve_packages(&app, &lens).await.unwrap();
+        let (pkg, source) = set.get(fixtures::BATTERY_RULES_PACKAGE_ID).unwrap();
+        assert_eq!(source, "fixtures");
+        assert_eq!(pkg.version, "1.0.0");
+
+        // A corrupt pinned file is an operator error, surfaced.
+        std::fs::write(dir.join("broken.prml"), "{ not json").unwrap();
+        let app = AppState::new(Config {
+            primmel_dir: Some(dir.clone()),
+            ..Config::default()
+        });
+        let err = resolve_packages(&app, &lens).await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let _ = std::fs::remove_file(dir.join("battery.prml"));
+        let _ = std::fs::remove_file(dir.join("broken.prml"));
+        let _ = std::fs::remove_dir(&dir);
     }
 }

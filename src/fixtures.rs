@@ -48,7 +48,60 @@ pub mod facts {
     pub const TOP_RUNNER: &str = "de.jp.top-runner-class";
     pub const CAPACITY_KWH: &str = "battery.capacity-kwh";
     pub const MARKETS: &str = "subject.markets";
+    pub const SOH: &str = "battery.soh-pct";
+    pub const SOH_UNCERTAINTY: &str = "battery.soh-u-pct";
+    pub const ROUND_TRIP_EFFICIENCY: &str = "battery.round-trip-efficiency-pct";
 }
+
+/// The built-in Primmel package (fixtures mode): the battery decision
+/// rules, as a `.prml` JSON document — the exact wire shape the
+/// parser serves, never a hand-built struct (the fixture proves the
+/// schema).
+pub const BATTERY_RULES_PRML: &str = r#"{
+  "id": "urn:primmel:pkg:battery-rules",
+  "version": "1.0.0",
+  "title": "Battery passport decision rules (two-lens demo)",
+  "rules": [
+    {
+      "id": "soh-guard-band",
+      "clause_urn": "urn:oiml:pub:r:91-2:2025#clause-6.1",
+      "title": "State of health >= 85 %, guarded acceptance with w = U",
+      "arms": [
+        { "label": "conforming",
+          "when": { "op": "ge",
+                    "lhs": { "sub": [ { "input": "soh" }, { "input": "U" } ] },
+                    "rhs": { "const": "85" } } },
+        { "label": "not-demonstrably-conforming" }
+      ]
+    },
+    {
+      "id": "efficiency-class",
+      "clause_urn": "urn:eu:reg:2017:1369#annex-ii",
+      "title": "Round-trip efficiency class bands",
+      "arms": [
+        { "label": "A", "when": { "op": "ge",
+                                  "lhs": { "input": "eff" },
+                                  "rhs": { "const": "92" } } },
+        { "label": "B", "when": { "op": "ge",
+                                  "lhs": { "input": "eff" },
+                                  "rhs": { "const": "85" } } },
+        { "label": "C" }
+      ]
+    }
+  ]
+}
+"#;
+
+/// The built-in Primmel package id.
+pub const BATTERY_RULES_PACKAGE_ID: &str = "urn:primmel:pkg:battery-rules";
+
+/// The guard-band rule id within the package.
+pub const SOH_GUARD_BAND_RULE: &str = "soh-guard-band";
+
+/// The efficiency class rule id within the package.
+pub const EFFICIENCY_CLASS_RULE: &str = "efficiency-class";
+
+use crate::primmel::{PackageSet, PrimmelPackage};
 
 use facts as f;
 
@@ -157,6 +210,17 @@ pub fn demo_passport() -> Passport {
                     (f::REPARABILITY.to_string(), "8.1".parse().unwrap()),
                     (f::CARBON.to_string(), "96.4".parse().unwrap()),
                     (f::CAPACITY_KWH.to_string(), "0.072".parse().unwrap()),
+                    // The battery state-of-health measurand and its
+                    // expanded uncertainty (k = 2): the guard-band
+                    // rule consumes both — 86.3 - 1.8 = 84.5 < 85, so
+                    // the JP lens reports *not demonstrably*
+                    // conforming although the bare value would pass.
+                    (f::SOH.to_string(), "86.3".parse().unwrap()),
+                    (f::SOH_UNCERTAINTY.to_string(), "1.8".parse().unwrap()),
+                    (
+                        f::ROUND_TRIP_EFFICIENCY.to_string(),
+                        "88.5".parse().unwrap(),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
@@ -261,28 +325,41 @@ pub fn eu_lens() -> LensManifest {
                 declared_unit: Some("kgCO2e".into()),
             },
         ],
-        transforms: vec![TransformBinding::Classification {
-            id: "eu-reparability-class".into(),
-            source: f::REPARABILITY.into(),
-            bands: vec![
-                ClassBand {
-                    label: "A".into(),
-                    min: "8.0".parse().unwrap(),
-                },
-                ClassBand {
-                    label: "B".into(),
-                    min: "6.0".parse().unwrap(),
-                },
-                ClassBand {
-                    label: "C".into(),
-                    min: "4.0".parse().unwrap(),
-                },
-                ClassBand {
-                    label: "D".into(),
-                    min: "0".parse().unwrap(),
-                },
-            ],
-        }],
+        transforms: vec![
+            TransformBinding::Classification {
+                id: "eu-reparability-class".into(),
+                source: f::REPARABILITY.into(),
+                bands: vec![
+                    ClassBand {
+                        label: "A".into(),
+                        min: "8.0".parse().unwrap(),
+                    },
+                    ClassBand {
+                        label: "B".into(),
+                        min: "6.0".parse().unwrap(),
+                    },
+                    ClassBand {
+                        label: "C".into(),
+                        min: "4.0".parse().unwrap(),
+                    },
+                    ClassBand {
+                        label: "D".into(),
+                        min: "0".parse().unwrap(),
+                    },
+                ],
+            },
+            // The EU lens also classifies the round-trip efficiency
+            // through the Primmel package — the output carries the
+            // clause URN of the class table it applies.
+            TransformBinding::Primmel {
+                id: "eu-efficiency-class".into(),
+                package_ref: BATTERY_RULES_PACKAGE_ID.into(),
+                rule_id: EFFICIENCY_CLASS_RULE.into(),
+                inputs: [("eff".to_string(), f::ROUND_TRIP_EFFICIENCY.to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        ],
     };
     lens.validate().expect("EU lens validates");
     lens
@@ -372,6 +449,22 @@ pub fn jp_lens() -> LensManifest {
                     },
                 ],
             },
+            // The guard-band moment: the same SoH the EU lens would
+            // call conforming (86.3 >= 85) is decided on the
+            // uncertainty-narrowed limit (86.3 - 1.8 = 84.5 < 85) —
+            // `not-demonstrably-conforming` under w = U, with the
+            // clause URN the rule implements.
+            TransformBinding::Primmel {
+                id: "jp-soh-guard-band".into(),
+                package_ref: BATTERY_RULES_PACKAGE_ID.into(),
+                rule_id: SOH_GUARD_BAND_RULE.into(),
+                inputs: [
+                    ("soh".to_string(), f::SOH.to_string()),
+                    ("U".to_string(), f::SOH_UNCERTAINTY.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
         ],
     };
     lens.validate().expect("JP lens validates");
@@ -417,6 +510,20 @@ pub fn demo_as_of() -> Timestamp {
     ts(DEMO_AS_OF)
 }
 
+/// The built-in Primmel package, parsed from its `.prml` wire
+/// document (the fixture proves the schema end to end).
+pub fn battery_rules_package() -> PrimmelPackage {
+    let doc: serde_json::Value =
+        serde_json::from_str(BATTERY_RULES_PRML).expect("fixture .prml is valid JSON");
+    PrimmelPackage::from_json(&doc).expect("fixture .prml package validates")
+}
+
+/// The built-in Primmel packages (fixtures mode): the battery
+/// decision-rule package, ready for the JP/EU lens bindings.
+pub fn fixture_primmel() -> PackageSet {
+    PackageSet::of(battery_rules_package(), "fixtures")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +556,79 @@ mod tests {
     #[test]
     fn demo_timestamps_parse() {
         assert_eq!(demo_as_of().to_string(), DEMO_AS_OF);
+    }
+
+    #[test]
+    fn fixture_primmel_package_parses_with_clause_urns() {
+        let pkg = battery_rules_package();
+        assert_eq!(pkg.id, BATTERY_RULES_PACKAGE_ID);
+        assert_eq!(pkg.version, "1.0.0");
+        let guard = pkg.rule(SOH_GUARD_BAND_RULE).unwrap();
+        assert_eq!(guard.clause_urn, "urn:oiml:pub:r:91-2:2025#clause-6.1");
+        let class = pkg.rule(EFFICIENCY_CLASS_RULE).unwrap();
+        assert_eq!(class.clause_urn, "urn:eu:reg:2017:1369#annex-ii");
+        for rule in &pkg.rules {
+            assert!(rule.clause_urn.starts_with("urn:"), "{}", rule.clause_urn);
+        }
+        let set = fixture_primmel();
+        let (got, source) = set.get(BATTERY_RULES_PACKAGE_ID).unwrap();
+        assert_eq!(got.id, BATTERY_RULES_PACKAGE_ID);
+        assert_eq!(source, "fixtures");
+    }
+
+    #[test]
+    fn demo_passport_carries_the_battery_measurands() {
+        // The guard-band and efficiency-class rules run on facts the
+        // demo passport provides, from the attested milestone.
+        let state = crate::twin::fold(&demo_passport(), demo_as_of());
+        for path in [
+            facts::SOH,
+            facts::SOH_UNCERTAINTY,
+            facts::ROUND_TRIP_EFFICIENCY,
+        ] {
+            let fact = state.get(path).unwrap();
+            assert!(matches!(fact.value, unidpp_model::FactValue::Num(_)));
+            assert_eq!(fact.origin.trust, TrustMarker::Attested);
+        }
+    }
+
+    #[test]
+    fn fixture_lenses_bind_primmel_rules() {
+        // Both fixture lenses carry a Primmel binding; the two-lens
+        // demo shows both rules live with clause-URN provenance.
+        for lens in [eu_lens(), jp_lens()] {
+            assert!(
+                lens.transforms.iter().any(|t| !t.package_refs().is_empty()),
+                "{} carries a primmel transform",
+                lens.id().as_str()
+            );
+        }
+        lens_primmel_evaluates();
+    }
+
+    /// The fixture package and lens bindings agree end to end: every
+    /// bound rule exists and every rule input is bound.
+    fn lens_primmel_evaluates() {
+        let pkg = battery_rules_package();
+        for lens in [eu_lens(), jp_lens()] {
+            for t in &lens.transforms {
+                let refs = t.package_refs();
+                let Some(p) = refs.first() else {
+                    continue;
+                };
+                assert_eq!(p, BATTERY_RULES_PACKAGE_ID);
+                if let crate::lens::TransformBinding::Primmel {
+                    rule_id, inputs, ..
+                } = t
+                {
+                    let rule = pkg
+                        .rule(rule_id)
+                        .unwrap_or_else(|| panic!("rule {rule_id} exists in the package"));
+                    for input in rule.inputs() {
+                        assert!(inputs.contains_key(&input), "input {input} is bound");
+                    }
+                }
+            }
+        }
     }
 }

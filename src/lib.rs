@@ -26,27 +26,35 @@
 //! - [`project`] — the projection engine: select elements (by twin
 //!   fact, provenance filter, capability gate), run transforms (exact
 //!   unit conversion through the ISO 80000 unit registry; band
-//!   classification tables from the manifest), and assemble the view
-//!   with its coverage report (reusing `unidpp-verdict`);
+//!   classification tables from the manifest; Primmel decision rules
+//!   with clause-URN provenance), and assemble the view with its
+//!   coverage report (reusing `unidpp-verdict`);
+//! - [`primmel`] — the Primmel rule-package model (TODO.impl C9): a
+//!   versioned set of deterministic decision rules, each carrying the
+//!   clause URN of the legal paragraph it implements, over a small
+//!   typed expression AST (comparisons/arithmetic/explicit rounding
+//!   on named inputs, exact decimals — never floats), with its JSON
+//!   `.prml` serialization and the deterministic evaluator;
 //! - [`registry`] — the read-side registry client: fetch profile
-//!   items and unit items from a `unidpp-registry` instance over
-//!   HTTP when one is configured (`UNIDPP_REGISTRY_URL`), with
-//!   deterministic built-in fixtures otherwise (the issuer's
-//!   registry-forwarding pattern, read side);
+//!   items, unit items, and primmel packages from a `unidpp-registry`
+//!   instance over HTTP when one is configured
+//!   (`UNIDPP_REGISTRY_URL`), with deterministic built-in fixtures
+//!   otherwise (the issuer's registry-forwarding pattern, read side);
 //! - [`http`] — the minimal async `http://` client shared by the
 //!   registry client and the integration tests (house pattern);
 //! - [`fixtures`] — the two-lens demonstration corpus: one laptop
-//!   passport (deterministic, fixed timestamps) and the EU/JP lens
-//!   manifests.
+//!   passport (deterministic, fixed timestamps), the EU/JP lens
+//!   manifests, and the built-in battery decision-rule `.prml`
+//!   package (a guard band with w = U; efficiency class bands).
 //!
 //! Division of labour (MECE): the registry owns item lifecycle
-//! (profiles, units — versioned supersession, as-of resolution); the
-//! issuer owns passport lifecycle; the projector owns nothing — it
-//! renders a passport under a profile and states exactly what it
-//! could not see. Honesty is the feature: every degradation (element
-//! absent as-of, provenance below the lens floor, capability gate,
-//! source fact missing for a transform, registry unreachable) is
-//! reported in the view, never silently dropped.
+//! (profiles, units, transform packages — versioned supersession,
+//! as-of resolution); the issuer owns passport lifecycle; the
+//! projector owns nothing — it renders a passport under a profile and
+//! states exactly what it could not see. Honesty is the feature: every
+//! degradation (element absent as-of, provenance below the lens floor,
+//! capability gate, source fact missing for a transform, registry
+//! unreachable) is reported in the view, never silently dropped.
 
 // Handlers and parse helpers return `Result<_, Response>` with the
 // ready-made error response by value — the idiomatic axum pattern;
@@ -57,12 +65,14 @@ pub mod api;
 pub mod fixtures;
 pub mod http;
 pub mod lens;
+pub mod primmel;
 pub mod project;
 pub mod registry;
 pub mod twin;
 
 pub use api::{run, Config, TestServer};
 pub use lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
+pub use primmel::{PackageSet, PrimmelPackage, PrimmelRule};
 pub use project::{project, MissingReason, ProfileSource, RegisteredUnit, ViewError};
 pub use registry::{FetchOutcome, RegistryClient};
 pub use twin::{FactOrigin, SourcedFact, TwinState};

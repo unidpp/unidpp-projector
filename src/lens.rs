@@ -21,7 +21,11 @@
 //!       "from_item": "unit-kwh", "to_item": "unit-mj" },
 //!     { "kind": "classification", "id": "eu-reparability-class",
 //!       "source": "de.dpp.reparability-score",
-//!       "bands": [ { "label": "A", "min": "8.0" } ] }
+//!       "bands": [ { "label": "A", "min": "8.0" } ] },
+//!     { "kind": "primmel", "id": "jp-soh-guard-band",
+//!       "package_ref": "urn:primmel:pkg:battery-rules",
+//!       "rule_id": "soh-guard-band",
+//!       "inputs": { "soh": "battery.soh-pct", "U": "battery.soh-u-pct" } }
 //!   ]
 //! }
 //! ```
@@ -31,8 +35,12 @@
 //! posture); the bindings state *where each element's value lives on
 //! the twin state and which provenance/capability it must clear*; the
 //! transforms state *how derived values are produced* (registered
-//! units, classification tables). The projector executes the manifest
-//! — it never hardcodes a jurisdiction.
+//! units, classification tables, and Primmel decision rules — each
+//! carrying the clause URN of the legal paragraph it implements). The
+//! projector executes the manifest — it never hardcodes a
+//! jurisdiction.
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -107,6 +115,23 @@ pub enum TransformBinding {
         source: String,
         bands: Vec<ClassBand>,
     },
+    /// A Primmel decision rule (deterministic, clause-URN-provenant):
+    /// the projector resolves `package_ref` against the packages it
+    /// holds (operator-pinned directory, registry transform items, or
+    /// the built-in fixtures) and evaluates `rule_id` over the named
+    /// inputs — the output carries the rule's `clause_urn`, the legal
+    /// paragraph the decision implements. Input *names* are the
+    /// rule's own; the binding maps them to twin fact paths, so one
+    /// package serves many lenses without naming any twin.
+    Primmel {
+        id: String,
+        /// The package URN the rule lives in.
+        package_ref: String,
+        /// The rule id within the package.
+        rule_id: String,
+        /// Rule input name → twin-state fact path.
+        inputs: BTreeMap<String, String>,
+    },
 }
 
 impl TransformBinding {
@@ -115,14 +140,20 @@ impl TransformBinding {
         match self {
             TransformBinding::UnitConversion { id, .. } => id,
             TransformBinding::Classification { id, .. } => id,
+            TransformBinding::Primmel { id, .. } => id,
         }
     }
 
-    /// The twin-state fact path the transform reads.
+    /// The twin-state fact path the transform reads (for a Primmel
+    /// binding: the first input's path in input-name order —
+    /// deterministic, informational; the full map is `inputs`).
     pub fn source(&self) -> &str {
         match self {
             TransformBinding::UnitConversion { source, .. } => source,
             TransformBinding::Classification { source, .. } => source,
+            TransformBinding::Primmel { inputs, .. } => {
+                inputs.values().next().map(String::as_str).unwrap_or("")
+            }
         }
     }
 
@@ -136,7 +167,18 @@ impl TransformBinding {
                 .into_iter()
                 .flatten()
                 .collect(),
-            TransformBinding::Classification { .. } => Vec::new(),
+            TransformBinding::Classification { .. } | TransformBinding::Primmel { .. } => {
+                Vec::new()
+            }
+        }
+    }
+
+    /// The Primmel package this transform binds, when it is a Primmel
+    /// binding (for package resolution), in encounter order.
+    pub fn package_refs(&self) -> Vec<String> {
+        match self {
+            TransformBinding::Primmel { package_ref, .. } => vec![package_ref.clone()],
+            _ => Vec::new(),
         }
     }
 }
@@ -236,7 +278,43 @@ impl LensManifest {
             if ids.contains(&t.id()) {
                 return Err(format!("duplicate transform id `{}`", t.id()));
             }
-            if t.source().trim().is_empty() {
+            if let TransformBinding::Primmel {
+                package_ref,
+                rule_id,
+                inputs,
+                ..
+            } = t
+            {
+                // Primmel bindings validate their own input map (the
+                // generic source check below would fire first on the
+                // empty map with a less specific message).
+                if package_ref.trim().is_empty() {
+                    return Err(format!("primmel transform `{}` names no package", t.id()));
+                }
+                if rule_id.trim().is_empty() {
+                    return Err(format!(
+                        "primmel transform `{}` names no rule of package `{package_ref}`",
+                        t.id()
+                    ));
+                }
+                if inputs.is_empty() {
+                    return Err(format!(
+                        "primmel transform `{}` binds no inputs (rule `{}` \
+                         of package `{package_ref}` needs at least one)",
+                        t.id(),
+                        rule_id
+                    ));
+                }
+                for (name, path) in inputs {
+                    if name.trim().is_empty() || path.trim().is_empty() {
+                        return Err(format!(
+                            "primmel transform `{}` has an empty input \
+                             binding (`{name}` -> `{path}`)",
+                            t.id()
+                        ));
+                    }
+                }
+            } else if t.source().trim().is_empty() {
                 return Err(format!(
                     "transform `{}` has an empty source fact path",
                     t.id()
@@ -440,6 +518,82 @@ mod tests {
         };
         let err = lens.validate().unwrap_err();
         assert!(err.contains("no bands"), "{err}");
+    }
+
+    #[test]
+    fn primmel_bindings_parse_and_validate() {
+        // Wire tag is kebab-case `kind`; inputs map rule names to twin
+        // fact paths.
+        let raw = json!({
+            "kind": "primmel",
+            "id": "jp-soh-guard-band",
+            "package_ref": "urn:primmel:pkg:battery-rules",
+            "rule_id": "soh-guard-band",
+            "inputs": { "soh": "battery.soh-pct", "U": "battery.soh-u-pct" }
+        });
+        let t: TransformBinding = serde_json::from_value(raw).unwrap();
+        match &t {
+            TransformBinding::Primmel {
+                package_ref,
+                rule_id,
+                inputs,
+                ..
+            } => {
+                assert_eq!(package_ref, "urn:primmel:pkg:battery-rules");
+                assert_eq!(rule_id, "soh-guard-band");
+                assert_eq!(inputs.len(), 2);
+                assert_eq!(inputs["soh"], "battery.soh-pct");
+            }
+            other => panic!("expected primmel binding, got {other:?}"),
+        }
+        assert_eq!(t.unit_items(), Vec::<String>::new());
+        assert_eq!(t.package_refs(), vec!["urn:primmel:pkg:battery-rules"]);
+        // Round trip through the typed model.
+        let back: TransformBinding =
+            serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+
+        // The fixture JP lens carries the guard-band binding and
+        // validates.
+        let jp = fixtures::jp_lens();
+        let primmel = jp
+            .transforms
+            .iter()
+            .find(|t| t.id() == "jp-soh-guard-band")
+            .unwrap();
+        assert_eq!(
+            primmel.package_refs(),
+            vec![fixtures::BATTERY_RULES_PACKAGE_ID.to_string()]
+        );
+        jp.validate().unwrap();
+
+        // Validation refuses the degenerate shapes.
+        let mut lens = minimal_lens();
+        lens.transforms = vec![TransformBinding::Primmel {
+            id: "p".into(),
+            package_ref: " ".into(),
+            rule_id: "r".into(),
+            inputs: [("a".to_string(), "fact.a".to_string())]
+                .into_iter()
+                .collect(),
+        }];
+        assert!(lens.validate().unwrap_err().contains("names no package"));
+
+        lens.transforms = vec![TransformBinding::Primmel {
+            id: "p".into(),
+            package_ref: "urn:primmel:pkg:x".into(),
+            rule_id: "r".into(),
+            inputs: BTreeMap::new(),
+        }];
+        assert!(lens.validate().unwrap_err().contains("binds no inputs"));
+
+        lens.transforms = vec![TransformBinding::Primmel {
+            id: "p".into(),
+            package_ref: "urn:primmel:pkg:x".into(),
+            rule_id: "r".into(),
+            inputs: [("a".to_string(), " ".to_string())].into_iter().collect(),
+        }];
+        assert!(lens.validate().unwrap_err().contains("empty input binding"));
     }
 
     #[test]
