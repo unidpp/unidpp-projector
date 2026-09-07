@@ -18,8 +18,13 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use unidpp_projector::http::{json_request, Url};
-use unidpp_projector::{fixtures, Config, TestServer};
+use unidpp_projector::{fixtures, Config, RollupSealer, TestServer};
 use unidpp_registry::{Config as RegistryConfig, TestServer as RegistryServer};
+use unidpp_signatif::rollup::check_rollup_signature;
+use unidpp_transform::quantity::UnitRegistry;
+use unidpp_transform::rollup::{
+    verify_rollup, RollupAttestation, RollupVerdict, TraversalMember, TraversalSet,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const DEMO_PASSPORT: &str = fixtures::DEMO_PASSPORT_ID;
@@ -99,6 +104,16 @@ async fn wired_projector(
     registry_url: Option<String>,
     passports: Vec<unidpp_cli::passport::Passport>,
 ) -> (TestServer, PathBuf) {
+    projector_with_config(registry_url, passports, |_| {}).await
+}
+
+/// [`wired_projector`] with a final configuration pass (the roll-up
+/// sealer tests arm the key the default projector does not hold).
+async fn projector_with_config(
+    registry_url: Option<String>,
+    passports: Vec<unidpp_cli::passport::Passport>,
+    tune: impl FnOnce(&mut Config),
+) -> (TestServer, PathBuf) {
     let dir = scratch_dir("store");
     for (i, passport) in passports.into_iter().enumerate() {
         std::fs::write(
@@ -107,11 +122,12 @@ async fn wired_projector(
         )
         .expect("passport document writes");
     }
-    let config = Config {
+    let mut config = Config {
         registry_url,
         passports_dir: Some(dir.clone()),
         ..Config::default()
     };
+    tune(&mut config);
     let server = TestServer::spawn(config).await.expect("projector spawns");
     (server, dir)
 }
@@ -449,6 +465,69 @@ async fn missing_child_is_a_coverage_gap_over_http() {
     assert_eq!(missing[0]["reason"], json!("document-unavailable"));
     // The rest of the view still renders.
     assert_eq!(view["profile"]["source"], json!("registry"));
+
+    projector.stop().await;
+    registry.stop().await;
+}
+
+#[tokio::test]
+async fn sealed_rollup_attestation_travels_over_http_and_verifies() {
+    let registry = seeded_registry().await;
+    let mut store = vec![fixtures::pack_system()];
+    store.extend(fixtures::pack_children());
+    const SEED: &str = "it-rollup-seed";
+    const ATTESTER: &str = "urn:unidpp:eo:projector";
+    let (projector, _dir) =
+        projector_with_config(Some(registry.base_url.clone()), store, |config| {
+            config.rollup_seed = Some(SEED.to_string());
+            config.rollup_attester = Some(ATTESTER.to_string());
+        })
+        .await;
+
+    let (status, view) = get_view(&projector.base_url, PACK_SYSTEM, PACK_LENS, DEMO_AT).await;
+    assert_eq!(status, 200, "{}", view);
+    let rollup = transformed(&view, "carbon-rollup");
+    assert_eq!(rollup["status"], json!("computed"));
+
+    // The canonical root over the same children, built straight from
+    // the core types: what the entry carries and the attestation
+    // seals are the same commitment.
+    let at = fixtures::demo_as_of();
+    let members: Vec<TraversalMember> = fixtures::pack_children()
+        .iter()
+        .map(|child| TraversalMember {
+            passport: child.passport_id.clone(),
+            version: 1,
+            state_hash: child.log.state_hash_at(at).unwrap(),
+            quantities: std::collections::BTreeMap::new(),
+        })
+        .collect();
+    let set = TraversalSet::new(members).unwrap();
+    assert_eq!(rollup["input_set_root"].as_str().unwrap(), set.root().hex());
+
+    // The attestation deserializes from the wire and verifies against
+    // the pinned anchor (the same seed's public key).
+    let attestation: RollupAttestation = serde_json::from_value(rollup["rollup"].clone()).unwrap();
+    assert_eq!(attestation.subject, fixtures::pack_system().passport_id);
+    assert_eq!(attestation.method_ref, "ISO 14067:2018");
+    let sealer = RollupSealer::seeded(SEED, ATTESTER).unwrap();
+    let anchor = sealer.public().unwrap();
+    let verdict = verify_rollup(
+        &attestation,
+        &set,
+        &UnitRegistry::iso80000(),
+        |slot, body| check_rollup_signature(slot, body, anchor),
+    );
+    assert_eq!(verdict, RollupVerdict::Verified);
+
+    // A second view seals the same commitment: the roots are stable
+    // across runs (the signatures differ by their attested moments,
+    // by design).
+    let (_, again) = get_view(&projector.base_url, PACK_SYSTEM, PACK_LENS, DEMO_AT).await;
+    assert_eq!(
+        transformed(&again, "carbon-rollup")["input_set_root"],
+        rollup["input_set_root"]
+    );
 
     projector.stop().await;
     registry.stop().await;

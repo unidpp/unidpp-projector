@@ -55,7 +55,10 @@
 //! - [`aggregate`] — the aggregation transform class (TODO.impl 66 /
 //!   T-18): cross-child roll-ups over the subject's active traversal
 //!   set, methodology-bound (`method_citation`) and committed to the
-//!   input set's root hash;
+//!   input set's canonical traversal-set root (the core transform
+//!   crate's Merkle rollup definition, TODO.impl 79), optionally
+//!   sealed with a signed roll-up attestation when the projector
+//!   holds a key ([`RollupSealer`]);
 //! - [`codelist`] — the localization / code-list mapping class
 //!   (TODO.impl 67 / T-19): registered code-list correspondences
 //!   (versioned registry items; EU A–E ↔ JP star display as the
@@ -94,7 +97,7 @@ pub mod registry;
 pub mod render;
 pub mod twin;
 
-pub use aggregate::{AggregationOperation, ChildDocuments};
+pub use aggregate::{AggregationOperation, ChildDocuments, RollupSealer};
 pub use api::{run, Config, TestServer};
 pub use codelist::{CodeListMapping, MappingEntry, MappingSet};
 pub use lens::{

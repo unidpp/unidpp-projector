@@ -46,7 +46,7 @@ use tokio::net::TcpListener;
 use unidpp_cli::passport::Passport;
 use unidpp_model::{Resolution, Timestamp};
 
-use crate::aggregate::ChildDocuments;
+use crate::aggregate::{ChildDocuments, RollupSealer};
 use crate::codelist::{CodeListMapping, MappingSet};
 use crate::fixtures;
 use crate::lens::LensManifest;
@@ -75,6 +75,17 @@ pub struct Config {
     /// packages, served before the registry and the built-in
     /// fixtures. `None` = registry/fixtures mode.
     pub primmel_dir: Option<PathBuf>,
+    /// Optional seed material for the roll-up sealing key
+    /// (`UNIDPP_PROJECTOR_ROLLUP_SEED`, TODO.impl 79): when set (with
+    /// an attester), aggregation entries carry a signed roll-up
+    /// attestation over their committed traversal set. `None` = the
+    /// keyless projector (no attestation is emitted).
+    pub rollup_seed: Option<String>,
+    /// The attester id the roll-up attestations name
+    /// (`UNIDPP_PROJECTOR_ROLLUP_ATTESTER`); required alongside the
+    /// seed (a seed without an attester is refused loudly, not armed
+    /// half-way).
+    pub rollup_attester: Option<String>,
 }
 
 impl Default for Config {
@@ -85,6 +96,8 @@ impl Default for Config {
             registry_token: None,
             passports_dir: None,
             primmel_dir: None,
+            rollup_seed: None,
+            rollup_attester: None,
         }
     }
 }
@@ -121,21 +134,60 @@ impl Config {
                 config.primmel_dir = Some(PathBuf::from(dir));
             }
         }
+        for (var, slot) in [
+            ("UNIDPP_PROJECTOR_ROLLUP_SEED", &mut config.rollup_seed),
+            (
+                "UNIDPP_PROJECTOR_ROLLUP_ATTESTER",
+                &mut config.rollup_attester,
+            ),
+        ] {
+            if let Ok(value) = std::env::var(var) {
+                if !value.is_empty() {
+                    *slot = Some(value);
+                }
+            }
+        }
         config
     }
 }
 
-/// Shared application state (immutable: the projector owns nothing).
+/// Shared application state (immutable: the projector owns nothing
+/// beyond its optional roll-up sealing key).
 pub struct AppState {
     pub config: Config,
     pub registry: RegistryClient,
+    /// The roll-up sealer derived from the configured seed (off when
+    /// no key is configured, or the configuration is incomplete — the
+    /// refusal is logged, never half-armed).
+    pub sealer: RollupSealer,
 }
 
 impl AppState {
     pub fn new(config: Config) -> AppState {
         let registry =
             RegistryClient::new(config.registry_url.clone(), config.registry_token.clone());
-        AppState { config, registry }
+        let sealer = match (&config.rollup_seed, &config.rollup_attester) {
+            (Some(seed), Some(attester)) => match RollupSealer::seeded(seed, attester) {
+                Ok(sealer) => sealer,
+                Err(e) => {
+                    eprintln!("unidpp-projector: roll-up sealing disabled ({e})");
+                    RollupSealer::off()
+                }
+            },
+            (Some(_), None) => {
+                eprintln!(
+                    "unidpp-projector: roll-up sealing disabled (a seed needs \
+                     UNIDPP_PROJECTOR_ROLLUP_ATTESTER)"
+                );
+                RollupSealer::off()
+            }
+            _ => RollupSealer::off(),
+        };
+        AppState {
+            config,
+            registry,
+            sealer,
+        }
     }
 }
 
@@ -229,7 +281,8 @@ async fn discovery() -> Result<Response, Response> {
         "selection_gates": ["capability-gate (subject class vs binding floor)", "presence (source fact on the twin state as-of)", "below-trust-floor (sourcing event marker vs binding floor)"],
         "sources": {
             "passports": "unidpp/passport@1 documents from UNIDPP_PROJECTOR_PASSPORTS_DIR, else the built-in two-lens fixture",
-            "children": "child passports of the traversal set (derived-issuance/combine inputs, replacements) from the same store or fixtures; aggregation transforms roll up over them and commit the input set's root hash",
+            "children": "child passports of the traversal set (derived-issuance/combine inputs, replacements) from the same store or fixtures; aggregation transforms roll up over them and commit the input set's canonical traversal-set root (unidpp-transform's Merkle rollup definition)",
+            "rollup": "signed roll-up attestations over the committed traversal set (subject = the parent passport, method_ref = the binding's method citation) when UNIDPP_PROJECTOR_ROLLUP_SEED + UNIDPP_PROJECTOR_ROLLUP_ATTESTER arm the projector's key; the field is absent otherwise, never a placeholder",
             "profiles": "unidpp-registry profile items at UNIDPP_REGISTRY_URL (point-in-time with at=), else built-in EU/JP fixtures",
             "units": "registry units subregister identity (ISO 80000 citation chain); conversions are exact through the local ISO 80000 seed",
             "primmel": ".prml rule packages from UNIDPP_PROJECTOR_PRIMMEL_DIR (operator pin), else the registry transform subregister, else built-in fixtures; each evaluated rule carries its clause_urn (the legal paragraph it implements)",
@@ -617,6 +670,7 @@ async fn view(
         &packages,
         &mappings,
         &children,
+        &app.sealer,
     )
     .map_err(|e| internal_error(&e.to_string()))?;
     if let Some(block) = doc.pointer_mut("/passport").and_then(Value::as_object_mut) {
@@ -1030,6 +1084,30 @@ mod tests {
     }
 
     #[test]
+    fn the_sealer_arms_only_from_a_seed_and_an_attester() {
+        // Seed + attester: armed.
+        let app = AppState::new(Config {
+            rollup_seed: Some("operator-seed".into()),
+            rollup_attester: Some("urn:unidpp:eo:projector".into()),
+            ..Config::default()
+        });
+        assert!(app.sealer.seals());
+        // A seed without an attester is refused loudly, not armed
+        // half-way (RollupAttestation::build requires the attester).
+        let app = AppState::new(Config {
+            rollup_seed: Some("operator-seed".into()),
+            ..Config::default()
+        });
+        assert!(!app.sealer.seals());
+        // The default projector is keyless.
+        assert!(!AppState::new(Config::default()).sealer.seals());
+        assert_eq!(
+            RollupSealer::seeded("seed", "  ").unwrap_err().to_string(),
+            "validation error: a roll-up sealer names its attester"
+        );
+    }
+
+    #[test]
     fn unit_identity_parses_from_a_registry_item() {
         let doc = json!({
             "identifier": "unit-kwh",
@@ -1066,6 +1144,7 @@ mod tests {
             &packages,
             &MappingSet::empty(),
             &ChildDocuments::empty(),
+            &RollupSealer::off(),
         )
         .unwrap();
         let jp = project(
@@ -1078,6 +1157,7 @@ mod tests {
             &packages,
             &MappingSet::empty(),
             &ChildDocuments::empty(),
+            &RollupSealer::off(),
         )
         .unwrap();
 

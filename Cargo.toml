@@ -9,20 +9,25 @@ description = "UniDPP lens projection service: render a passport under a registe
 
 # Dependency-light on purpose (mirroring unidpp-registry /
 # unidpp-issuer doctrine): axum/tokio for serving, serde(+json) for
-# documents. The model, event folding, verdict coverage, and exact
-# quantity machinery all live in the path-dependency crates; the CLI
-# lib supplies the passport document type (`unidpp/passport@1` — the
-# service must never fork that shape). No tracing, no metrics, no TLS
-# stack (terminate at a fronting proxy), no database: the passport
-# store is a directory of CLI passport documents and the profile
-# manifests come from a `unidpp-registry` instance over HTTP, with
-# deterministic built-in fixtures when none is configured or reachable.
+# documents. The model, event folding, verdict coverage, exact
+# quantity, and roll-up commitment machinery all live in the
+# path-dependency crates; the CLI lib supplies the passport document
+# type (`unidpp/passport@1` — the service must never fork that shape);
+# signatif supplies the roll-up attestation signing (the projector is
+# otherwise keyless — the sealer is optional and seed-configured, and
+# is the only place a secret lives in this service). No tracing, no
+# metrics, no TLS stack (terminate at a fronting proxy), no database:
+# the passport store is a directory of CLI passport documents and the
+# profile manifests come from a `unidpp-registry` instance over HTTP,
+# with deterministic built-in fixtures when none is configured or
+# reachable.
 [dependencies]
 unidpp-model = { path = "../unidpp-core/crates/model" }
 unidpp-event = { path = "../unidpp-core/crates/event" }
 unidpp-verdict = { path = "../unidpp-core/crates/verdict" }
 unidpp-transform = { path = "../unidpp-core/crates/transform" }
 unidpp-cli = { path = "../unidpp-cli" }
+unidpp-signatif = { path = "../unidpp-signatif" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }

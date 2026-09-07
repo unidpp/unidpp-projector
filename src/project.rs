@@ -36,11 +36,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Map, Value};
 
 use unidpp_cli::passport::Passport;
-use unidpp_model::{CapabilityClass, Decimal, FactValue, Timestamp, TrustMarker};
+use unidpp_model::{CapabilityClass, Decimal, FactValue, PassportId, Timestamp, TrustMarker};
 use unidpp_transform::quantity::{Quantity, UnitRegistry};
 use unidpp_verdict::CoverageReport;
 
-use crate::aggregate::{aggregation_json, ChildDocuments};
+use crate::aggregate::{aggregation_json, ChildDocuments, RollupSealer};
 use crate::codelist::{MappingSet, UNMAPPED};
 use crate::lens::{ClassBand, DataPointBinding, LensManifest, TransformBinding};
 use crate::primmel::{EvalError, PackageSet};
@@ -141,7 +141,10 @@ impl std::error::Error for ViewError {}
 /// `mappings` holds the registered code-list mapping items the lens's
 /// localization bindings reference; `children` holds the child
 /// passport documents of the traversal set (empty when the subject
-/// has no aggregation bindings or no resolvable children).
+/// has no aggregation bindings or no resolvable children); `sealer`
+/// is the projector's roll-up sealing identity
+/// ([`RollupSealer::off`] when it holds no key — aggregation entries
+/// then carry no attestation).
 #[allow(clippy::too_many_arguments)]
 pub fn project(
     passport: &Passport,
@@ -153,6 +156,7 @@ pub fn project(
     packages: &PackageSet,
     mappings: &MappingSet,
     children: &ChildDocuments,
+    sealer: &RollupSealer,
 ) -> Result<Value, ViewError> {
     lens.validate().map_err(ViewError::Invalid)?;
     let state = twin::fold(passport, at);
@@ -186,6 +190,7 @@ pub fn project(
     for binding in &lens.transforms {
         transformed.push(transform_json(
             binding,
+            &passport.passport_id,
             &state,
             lens,
             &unit_registry,
@@ -194,6 +199,7 @@ pub fn project(
             packages,
             mappings,
             children,
+            sealer,
         ));
     }
 
@@ -357,6 +363,7 @@ pub(crate) fn fact_value_json(value: &FactValue) -> Value {
 #[allow(clippy::too_many_arguments)]
 fn transform_json(
     binding: &TransformBinding,
+    subject: &PassportId,
     state: &twin::TwinState,
     lens: &LensManifest,
     unit_registry: &UnitRegistry,
@@ -365,6 +372,7 @@ fn transform_json(
     packages: &PackageSet,
     mappings: &MappingSet,
     children: &ChildDocuments,
+    sealer: &RollupSealer,
 ) -> Value {
     let mut m = Map::new();
     m.insert("id".into(), json!(binding.id()));
@@ -417,8 +425,11 @@ fn transform_json(
             input_binding,
             weight_binding,
             method_citation,
+            subject,
             state,
             children,
+            unit_registry,
+            sealer,
             at,
         );
     }
@@ -1003,6 +1014,7 @@ mod tests {
             packages,
             &MappingSet::empty(),
             &ChildDocuments::empty(),
+            &RollupSealer::off(),
         )
         .unwrap()
     }
@@ -1478,6 +1490,7 @@ mod tests {
             &PackageSet::empty(),
             &MappingSet::empty(),
             &children,
+            &RollupSealer::off(),
         )
         .unwrap()
     }
@@ -1611,6 +1624,7 @@ mod tests {
             &PackageSet::empty(),
             &MappingSet::empty(),
             &ChildDocuments::of(children),
+            &RollupSealer::off(),
         )
         .unwrap();
         let count = &view["transformed"][0];
@@ -1640,6 +1654,7 @@ mod tests {
             &PackageSet::empty(),
             &MappingSet::empty(),
             &children,
+            &RollupSealer::off(),
         )
         .unwrap();
         let rollup = pack_transform(&view, "carbon-rollup");
@@ -1684,6 +1699,7 @@ mod tests {
             &PackageSet::empty(),
             &MappingSet::empty(),
             &ChildDocuments::empty(),
+            &RollupSealer::off(),
         )
         .unwrap();
         let rollup = &view["transformed"][0];
@@ -1769,6 +1785,7 @@ mod tests {
             &PackageSet::empty(),
             &mappings,
             &ChildDocuments::of(crate::fixtures::pack_children()),
+            &RollupSealer::off(),
         )
         .unwrap();
         let stars = pack_transform(&view, "jp-star-display");
@@ -1830,6 +1847,7 @@ mod tests {
             &PackageSet::empty(),
             &mappings,
             &ChildDocuments::empty(),
+            &RollupSealer::off(),
         )
         .unwrap();
         let back = &view["transformed"][0];
@@ -1874,6 +1892,7 @@ mod tests {
             &PackageSet::empty(),
             &mappings,
             &ChildDocuments::empty(),
+            &RollupSealer::off(),
         )
         .unwrap();
         let stars = pack_transform(&view, "jp-star-display");
@@ -1893,6 +1912,7 @@ mod tests {
             &PackageSet::empty(),
             mappings,
             &ChildDocuments::of(crate::fixtures::pack_children()),
+            &RollupSealer::off(),
         )
         .unwrap()
     }
@@ -1912,6 +1932,7 @@ mod tests {
                 &PackageSet::empty(),
                 &MappingSet::empty(),
                 &ChildDocuments::empty(),
+                &RollupSealer::off(),
             ),
             Err(ViewError::Invalid(_))
         ));
