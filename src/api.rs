@@ -264,6 +264,8 @@ impl TestServer {
 async fn discovery() -> Result<Response, Response> {
     let doc = json!({
         "service": "unidpp-projector",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_id": option_env!("UNIDPP_BUILD_ID").unwrap_or("dev"),
         "description": "UniDPP lens projection service: render a passport under a registered profile (view + coverage report) — the EU/JP two-lens moment as a service",
         "endpoints": {
             "view": "GET /view?passport=<passport-id>&profile=<profile-item>&actor=<role>[&at=<RFC3339>]",
