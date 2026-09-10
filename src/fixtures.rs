@@ -359,6 +359,7 @@ pub fn eu_lens() -> LensManifest {
     let lens = LensManifest {
         version: "1.0.0".to_string(),
         profile: ProfileManifest {
+            issuer_class: unidpp_model::IssuerClass::Consensus,
             id: ProfileId::new(EU_LENS_ID).unwrap(),
             axes: ProfileAxes::jurisdiction("EU").with_sector("electronics"),
             trigger: TriggerPredicate::Any,
@@ -448,6 +449,7 @@ pub fn jp_lens() -> LensManifest {
     let lens = LensManifest {
         version: "1.0.0".to_string(),
         profile: ProfileManifest {
+            issuer_class: unidpp_model::IssuerClass::Consensus,
             id: ProfileId::new(JP_LENS_ID).unwrap(),
             axes: ProfileAxes::jurisdiction("JP").with_sector("electronics"),
             trigger: TriggerPredicate::FactContains {
@@ -574,6 +576,7 @@ pub fn consumer_lens() -> LensManifest {
     let lens = LensManifest {
         version: "1.0.0".to_string(),
         profile: ProfileManifest {
+            issuer_class: unidpp_model::IssuerClass::Consensus,
             id: ProfileId::new(CONSUMER_LENS_ID).unwrap(),
             axes: ProfileAxes::jurisdiction("EU"),
             trigger: TriggerPredicate::Any,
@@ -842,6 +845,7 @@ pub fn pack_lens() -> LensManifest {
     let lens = LensManifest {
         version: "1.0.0".to_string(),
         profile: ProfileManifest {
+            issuer_class: unidpp_model::IssuerClass::Consensus,
             id: ProfileId::new(PACK_LENS_ID).unwrap(),
             axes: ProfileAxes::jurisdiction("EU").with_sector("batteries"),
             trigger: TriggerPredicate::Any,

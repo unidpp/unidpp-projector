@@ -738,6 +738,7 @@ mod tests {
             version: "1.0.0".into(),
             profile: ProfileManifest {
                 id: ProfileId::new("urn:unidpp:profile:test-min").unwrap(),
+                issuer_class: unidpp_model::IssuerClass::Consensus,
                 axes: ProfileAxes::jurisdiction("EU"),
                 trigger: TriggerPredicate::Any,
                 min_capability: CapabilityClass::Silent,
