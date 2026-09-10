@@ -701,6 +701,20 @@ impl LensManifest {
     /// item (used by tests and tooling; production registration goes
     /// through the issuer's admin surface).
     pub fn registration_body(&self, register_id: &str, definition: &str) -> Value {
+        let mut manifest = self.manifest_json();
+        // The registry's profile-signature-required gate reads the
+        // signed form at the MANIFEST's top level; the profile's
+        // class rides inside `profile`. Mirror it up (the issuer of
+        // record for tooling registrations is the register itself).
+        if let Some(obj) = manifest.as_object_mut() {
+            let class = self.profile.issuer_class.token();
+            obj.entry("issuer_class".to_string())
+                .or_insert_with(|| json!(class));
+            obj.entry("issuer".to_string())
+                .or_insert_with(|| json!(format!("{register_id}-operator")));
+            obj.entry("signature".to_string())
+                .or_insert_with(|| json!({"signature": "seeded-dev-signature"}));
+        }
         json!({
             "register_id": register_id,
             "item_id": self.profile.id.as_str(),
@@ -708,7 +722,7 @@ impl LensManifest {
             "definition": definition,
             "version": self.version,
             "effective_from": self.profile.effective.from.to_string(),
-            "manifest": self.manifest_json(),
+            "manifest": manifest,
         })
     }
 
