@@ -339,7 +339,9 @@ mod tests {
             fact.value,
             FactValue::Num("94.9".parse::<unidpp_model::Decimal>().unwrap())
         );
-        assert_eq!(fact.origin.seq, 8);
+        // seq 11: appended after the demo passport's 11 events (8
+        // lifecycle + 3 CN protocol checks).
+        assert_eq!(fact.origin.seq, 11);
         assert_eq!(fact.origin.trust, TrustMarker::MultiSigned);
     }
 
@@ -356,7 +358,7 @@ mod tests {
             FactValue::Str("1.07".into())
         );
         assert_eq!(state.status, Status::Issued);
-        assert_eq!(state.event_count, 8);
+        assert_eq!(state.event_count, 11);
         // The laptop's part replacement: the added sodimm is an active
         // child as-of the demo instant, the removed one is not.
         assert_eq!(

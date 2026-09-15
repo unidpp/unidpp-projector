@@ -44,6 +44,9 @@ pub const JP_LENS_ID: &str = "urn:unidpp:profile:jp-meti-pse";
 /// The consumer presentation lens item id (TODO.impl 54).
 pub const CONSUMER_LENS_ID: &str = "urn:unidpp:profile:consumer-dpp";
 
+/// The CN regulatory protocol lens item id (TODO.impl 224).
+pub const CN_PROTOCOL_LENS_ID: &str = "urn:unidpp:profile:cn-protocol-checks";
+
 /// The EU battery-pack-system roll-up lens item id (TODO.impl 66/67).
 pub const PACK_LENS_ID: &str = "urn:unidpp:profile:eu-battery-packs";
 
@@ -91,6 +94,12 @@ pub mod facts {
     pub const PACK_MASS: &str = "pack.mass-kg";
     /// Per-pack state of health (%).
     pub const PACK_SOH: &str = "pack.soh-pct";
+    /// CN regulatory protocol conformance (TODO.impl 224): the
+    /// MobileQR `ProtocolChecks` as data points — national regimes as
+    /// registry content, named not embedded in prose.
+    pub const CN_PROTOCOL_3C: &str = "cn.protocol.3c";
+    pub const CN_PROTOCOL_PRODUCER: &str = "cn.protocol.producer-regulation";
+    pub const CN_PROTOCOL_LICENSE: &str = "cn.protocol.industrial-license";
 }
 
 /// Canonical element refs of the consumer lens's data points.
@@ -104,6 +113,11 @@ pub const ENERGY_LABEL_ELEMENT: &str = "ferin:eu/eu.energy-label-class@1.0.0";
 pub const PACK_CARBON_ELEMENT: &str = "ferin:eu/pack.carbon-footprint@1.0.0";
 pub const PACK_MASS_ELEMENT: &str = "ferin:eu/pack.mass-kg@1.0.0";
 pub const PACK_SOH_ELEMENT: &str = "ferin:eu/pack.soh-pct@1.0.0";
+/// Canonical element refs of the CN protocol-check lens's data points
+/// (TODO.impl 224).
+pub const CN_3C_ELEMENT: &str = "ferin:cn/cn.protocol.3c@1.0.0";
+pub const CN_PRODUCER_ELEMENT: &str = "ferin:cn/cn.protocol.producer-regulation@1.0.0";
+pub const CN_LICENSE_ELEMENT: &str = "ferin:cn/cn.protocol.industrial-license@1.0.0";
 
 /// The built-in Primmel package (fixtures mode): the battery decision
 /// rules, as a `.prml` JSON document — the exact wire shape the
@@ -313,6 +327,54 @@ pub fn demo_passport() -> Passport {
                 like_for_like: false,
             },
             TrustMarker::Attested,
+        ),
+        // CN market entry: the regulatory protocol conformance
+        // declarations (TODO.impl 224) — the MobileQR ProtocolChecks
+        // pattern. 3C attested by the licensed CAB; producer-regulation
+        // declared by the operator; industrial licensing *not* obtained
+        // — a stated false, never an omission.
+        event(
+            8,
+            "2027-02-11T10:50:00Z",
+            "conformity assessment body",
+            "urn:unidpp:actor:cab-cnccc-licensed",
+            EventType::Correction,
+            EventPayload::Correction {
+                field: f::CN_PROTOCOL_3C.into(),
+                prior_value: String::new(),
+                new_value: "true".into(),
+                reason: "CCC certification protocol conformance (CN market entry)".into(),
+            },
+            TrustMarker::Attested,
+        ),
+        event(
+            9,
+            "2027-02-11T10:51:00Z",
+            "economic operator",
+            "urn:unidpp:actor:oem-nordwave",
+            EventType::Correction,
+            EventPayload::Correction {
+                field: f::CN_PROTOCOL_PRODUCER.into(),
+                prior_value: String::new(),
+                new_value: "true".into(),
+                reason: "producer-regulation protocol conformance declaration".into(),
+            },
+            TrustMarker::SelfDeclared,
+        ),
+        event(
+            10,
+            "2027-02-11T10:52:00Z",
+            "economic operator",
+            "urn:unidpp:actor:oem-nordwave",
+            EventType::Correction,
+            EventPayload::Correction {
+                field: f::CN_PROTOCOL_LICENSE.into(),
+                prior_value: String::new(),
+                new_value: "false".into(),
+                reason: "industrial product production licence not required for this class"
+                    .into(),
+            },
+            TrustMarker::SelfDeclared,
         ),
     ];
     for e in events {
@@ -681,6 +743,87 @@ pub fn consumer_lens() -> LensManifest {
     lens
 }
 
+/// The CN regulatory protocol lens (TODO.impl 224): the MobileQR
+/// `ProtocolChecks` pattern as a registered profile — national
+/// conformity regimes (CCC certification, producer regulation,
+/// industrial licensing) as *named data points with labels*, not
+/// prose embedded in a page. A cross-jurisdiction verifier resolves
+/// the CN protocol checks of any passport carrying them; the demo
+/// passport carries all three (one deliberately false — stated, never
+/// omitted).
+pub fn cn_protocol_lens() -> LensManifest {
+    let labels = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(l, t)| (l.to_string(), t.to_string()))
+            .collect()
+    };
+    let presented = |element: &str, pairs: &[(&str, &str)]| PresentationElement {
+        element: element.to_string(),
+        labels: labels(pairs),
+    };
+    let binding = |element: &str, source: &str, min_trust: TrustMarker| DataPointBinding {
+        element: element.into(),
+        source: source.into(),
+        min_trust,
+        min_capability: CapabilityClass::Silent,
+        declared_unit: None,
+    };
+    let lens = LensManifest {
+        version: "1.0.0".to_string(),
+        profile: ProfileManifest {
+            issuer_class: unidpp_model::IssuerClass::Consensus,
+            id: ProfileId::new(CN_PROTOCOL_LENS_ID).unwrap(),
+            axes: ProfileAxes::jurisdiction("CN"),
+            trigger: TriggerPredicate::Any,
+            min_capability: CapabilityClass::Silent,
+            freshness: FreshnessRequirement::Static,
+            effective: Interval::starting(ts("2026-01-01T00:00:00Z")),
+            data_points: vec![
+                DataPointRef::new("ferin:cn", "cn.protocol.3c", Some("1.0.0")).unwrap(),
+                DataPointRef::new("ferin:cn", "cn.protocol.producer-regulation", Some("1.0.0"))
+                    .unwrap(),
+                DataPointRef::new("ferin:cn", "cn.protocol.industrial-license", Some("1.0.0"))
+                    .unwrap(),
+            ],
+            crypto_suites: vec![SignatureSuite::EcdsaP256],
+            confidential: false,
+            resolution: Resolution::Public,
+            edge_visibility: VisibilityClass::Public,
+            traversal: Traversal::Public,
+        },
+        bindings: vec![
+            binding(CN_3C_ELEMENT, f::CN_PROTOCOL_3C, TrustMarker::Attested),
+            binding(
+                CN_PRODUCER_ELEMENT,
+                f::CN_PROTOCOL_PRODUCER,
+                TrustMarker::SelfDeclared,
+            ),
+            binding(
+                CN_LICENSE_ELEMENT,
+                f::CN_PROTOCOL_LICENSE,
+                TrustMarker::SelfDeclared,
+            ),
+        ],
+        transforms: vec![],
+        presentation: Some(PresentationBinding {
+            template_ref: "urn:unidpp:template:cn-protocol-v1".to_string(),
+            formatting: FormattingRules::default(),
+            sections: vec![PresentationSection {
+                id: "regulatory".to_string(),
+                labels: labels(&[("zh", "监管协议核查"), ("en", "Regulatory protocol checks")]),
+                elements: vec![
+                    presented(CN_3C_ELEMENT, &[("zh", "强制性产品认证（CCC）"), ("en", "CCC certification protocol")]),
+                    presented(CN_PRODUCER_ELEMENT, &[("zh", "生产者法规"), ("en", "Producer regulation protocol")]),
+                    presented(CN_LICENSE_ELEMENT, &[("zh", "工业产品生产许可证"), ("en", "Industrial product production licence")]),
+                ],
+            }],
+        }),
+    };
+    lens.validate().expect("CN protocol lens validates");
+    lens
+}
+
 /// One battery-pack child: issued, then an attested milestone carrying
 /// its carbon footprint (kgCO2e), mass (kg) and state of health (%).
 /// Values chosen so the demo weighted average divides exactly.
@@ -979,6 +1122,7 @@ pub fn fixture_lens(profile_id: &str) -> Option<LensManifest> {
         EU_LENS_ID => Some(eu_lens()),
         JP_LENS_ID => Some(jp_lens()),
         CONSUMER_LENS_ID => Some(consumer_lens()),
+        CN_PROTOCOL_LENS_ID => Some(cn_protocol_lens()),
         PACK_LENS_ID => Some(pack_lens()),
         _ => None,
     }
@@ -1031,6 +1175,7 @@ pub fn fixture_primmel() -> PackageSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn demo_passport_round_trips_through_the_document_shape() {
@@ -1044,7 +1189,8 @@ mod tests {
     #[test]
     fn demo_passport_log_is_consistent() {
         let p = demo_passport();
-        assert_eq!(p.log.len(), 8);
+        // 8 core lifecycle events + the 3 CN protocol-check corrections.
+        assert_eq!(p.log.len(), 11);
         p.log.verify().expect("fixture hash chain verifies");
         assert_eq!(p.log.subject(), &p.passport_id);
     }
@@ -1222,5 +1368,41 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn the_cn_protocol_lens_renders_the_regime_checks_in_chinese() {
+        // TODO.impl 224: regulatory protocol conformance as named
+        // data points (the MobileQR ProtocolChecks pattern) — rendered
+        // through the same presentation machinery, labels served in
+        // the requested language, the false check stated not omitted.
+        let passport = demo_passport();
+        let lens = cn_protocol_lens();
+        let source = crate::project::ProfileSource::fallback("fixtures", None);
+        let doc = crate::render::render(&passport, &lens, demo_as_of(), "zh", &source)
+            .expect("the CN protocol lens renders");
+        let sections = doc.pointer("/sections").unwrap().as_array().unwrap();
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section["label"], json!("监管协议核查"));
+        let items = section["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["label"], json!("强制性产品认证（CCC）"));
+        assert_eq!(items[0]["label_lang"], json!("zh"));
+        assert_eq!(items[0]["formatted"], json!("true"));
+        assert_eq!(items[1]["label"], json!("生产者法规"));
+        assert_eq!(items[1]["formatted"], json!("true"));
+        // The not-obtained licence: a stated false, never an omission.
+        assert_eq!(items[2]["label"], json!("工业产品生产许可证"));
+        assert_eq!(items[2]["formatted"], json!("false"));
+        assert_eq!(doc.pointer("/coverage/complete").unwrap(), &json!(true));
+        assert_eq!(doc.pointer("/coverage/elements_present").unwrap(), &json!(3));
+        // Every serialization carries the regime: the HTML page names
+        // the section, the text form speaks it.
+        let page = crate::html::document(&doc);
+        assert!(page.contains("监管协议核查"));
+        assert!(page.contains("工业产品生产许可证"));
+        let spoken = crate::html::text(&doc);
+        assert!(spoken.contains("强制性产品认证（CCC）: true."));
+        assert!(spoken.contains("工业产品生产许可证: false."));
     }
 }
