@@ -269,7 +269,7 @@ async fn discovery() -> Result<Response, Response> {
         "description": "UniDPP lens projection service: render a passport under a registered profile (view + coverage report) — the EU/JP two-lens moment as a service",
         "endpoints": {
             "view": "GET /view?passport=<passport-id>&profile=<profile-item>&actor=<role>[&at=<RFC3339>]",
-            "render": "GET /render?passport=<passport-id>&profile=<profile-item>&lang=<tag>[&at=<RFC3339>][&format=html|json] — JSON by default; Accept: text/html (or format=html, which outranks the header) serves the same render as a standalone consumer page",
+            "render": "GET /render?passport=<passport-id>&profile=<profile-item>&lang=<tag>[&at=<RFC3339>][&format=html|text|json] — JSON by default; Accept: text/html or text/plain (or the explicit format parameter, which outranks the header) serves the same render as a standalone consumer page (HTML) or as speakable text (the TTS substrate)",
             "health": "GET /healthz"
         },
         "view_contract": {
@@ -722,27 +722,26 @@ fn parse_render_query(params: &HashMap<String, String>) -> Result<RenderQuery, R
 /// binding, localized, formatted, with links to the authoritative
 /// sources and the same coverage honesty as the view.
 ///
-/// One presentation computation, two wire formats (TODO.impl 224):
-/// JSON by default; `Accept: text/html` (or an explicit `format`
-/// parameter, which outranks the header) serves the same render
-/// document serialized to a standalone HTML page — the consumer
-/// surface a scanned code resolves to.
+/// One presentation computation, three wire formats (TODO.impl 224):
+/// JSON by default; `Accept: text/html` or `text/plain` (or an
+/// explicit `format` parameter, which outranks the header) serves the
+/// same render document as a standalone HTML page or as speakable
+/// text (the TTS substrate) — the consumer surfaces a scanned code
+/// resolves to.
 async fn render_handler(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let query = parse_render_query(&params)?;
-    match crate::html::requested_format(
+    let format = crate::html::requested_format(
         &params,
         headers.get("accept").and_then(|v| v.to_str().ok()),
-    ) {
-        crate::html::Format::Invalid(other) => {
-            return Err(bad_request(format!(
-                "unknown `format` `{other}` — `html` or `json`"
-            )))
-        }
-        crate::html::Format::Html | crate::html::Format::Json => {}
+    );
+    if let crate::html::Format::Invalid(other) = &format {
+        return Err(bad_request(format!(
+            "unknown `format` `{other}` — `html`, `text` or `json`"
+        )));
     }
     let as_of = query.at.unwrap_or_else(Timestamp::now);
 
@@ -787,18 +786,24 @@ async fn render_handler(
     if let Some(block) = doc.pointer_mut("/passport").and_then(Value::as_object_mut) {
         block.insert("source".into(), json!(passport_source));
     }
-    if crate::html::requested_format(
-        &params,
-        headers.get("accept").and_then(|v| v.to_str().ok()),
-    ) == crate::html::Format::Html
-    {
+    if let Some((content_type, body)) = match &format {
+        crate::html::Format::Html => Some((
+            "text/html; charset=utf-8",
+            crate::html::document(&doc),
+        )),
+        crate::html::Format::Text => Some((
+            "text/plain; charset=utf-8",
+            crate::html::text(&doc),
+        )),
+        _ => None,
+    } {
         return Ok(build_response(
             StatusCode::OK,
             vec![
-                ("content-type".into(), "text/html; charset=utf-8".into()),
+                ("content-type".into(), content_type.into()),
                 ("x-as-of".into(), as_of.to_string()),
             ],
-            crate::html::document(&doc),
+            body,
         ));
     }
     Ok(stamped(StatusCode::OK, &doc, as_of))

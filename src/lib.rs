@@ -101,7 +101,7 @@ pub mod twin;
 pub use aggregate::{AggregationOperation, ChildDocuments, RollupSealer};
 pub use api::{run, Config, TestServer};
 pub use codelist::{CodeListMapping, MappingEntry, MappingSet};
-pub use html::{document as render_html, Format as RenderFormat};
+pub use html::{document as render_html, text as render_text, Format as RenderFormat};
 pub use lens::{
     ClassBand, DataPointBinding, FormattingRules, LensManifest, PresentationBinding,
     PresentationSection, TransformBinding, UnitPosition,

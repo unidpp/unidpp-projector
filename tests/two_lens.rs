@@ -887,6 +887,35 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
     .unwrap();
     assert!(forced_html.header("content-type").unwrap().starts_with("text/html"));
 
+    // The text form: the same render as speakable text (the TTS
+    // substrate), honest about its gap, negotiable by Accept too.
+    let spoken = json_request(
+        "GET",
+        &render_url(&format!("{query}&format=text")),
+        None,
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(spoken.status, 200);
+    assert!(spoken.header("content-type").unwrap().starts_with("text/plain"));
+    let spoken_body = spoken.body_string();
+    assert!(spoken_body.contains("Battery capacity: "), "labels serialize");
+    assert!(spoken_body.contains("not shown — "), "the gap is spoken");
+    assert!(!spoken_body.contains('<'), "no markup");
+    let via_accept = unidpp_projector::http::request(
+        "GET",
+        &Url::parse(&render_url(&query)).unwrap(),
+        &[("accept".to_string(), "text/plain".to_string())],
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(via_accept.header("content-type").unwrap().starts_with("text/plain"));
+    assert_eq!(via_accept.body_string(), spoken_body);
+
     // An unknown format is refused with a stated reason.
     let bad = json_request(
         "GET",
