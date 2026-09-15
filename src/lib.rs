@@ -89,6 +89,7 @@ pub mod aggregate;
 pub mod api;
 pub mod codelist;
 pub mod fixtures;
+pub mod html;
 pub mod http;
 pub mod lens;
 pub mod primmel;
@@ -100,6 +101,7 @@ pub mod twin;
 pub use aggregate::{AggregationOperation, ChildDocuments, RollupSealer};
 pub use api::{run, Config, TestServer};
 pub use codelist::{CodeListMapping, MappingEntry, MappingSet};
+pub use html::{document as render_html, Format as RenderFormat};
 pub use lens::{
     ClassBand, DataPointBinding, FormattingRules, LensManifest, PresentationBinding,
     PresentationSection, TransformBinding, UnitPosition,

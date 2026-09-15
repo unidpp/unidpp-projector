@@ -803,3 +803,102 @@ async fn demo_output_is_printable() {
     projector.stop().await;
     registry.stop().await;
 }
+
+#[tokio::test]
+async fn the_render_serves_html_to_browsers_and_json_to_clients() {
+    // TODO.impl 224: one render computation, two wire formats. The
+    // explicit `format` parameter outranks `Accept`; `Accept` decides
+    // when the parameter is absent; JSON stays the default.
+    let projector = TestServer::spawn(Config::default()).await.unwrap();
+    let base = projector.base_url.clone();
+    let query = format!(
+        "?passport={}&profile={}&lang=en&at={}",
+        Url::encode_query_component(DEMO_PASSPORT),
+        Url::encode_query_component(fixtures::CONSUMER_LENS_ID),
+        Url::encode_query_component(DEMO_AT)
+    );
+    let render_url =
+        |q: &str| format!("{base}/render{q}");
+
+    // A browser's Accept (text/html first) → the HTML serialization.
+    let browser = unidpp_projector::http::request(
+        "GET",
+        &Url::parse(&render_url(&query)).unwrap(),
+        &[(
+            "accept".to_string(),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
+        )],
+        None,
+        TIMEOUT,
+    )
+    .await
+    .expect("browser render request completes");
+    assert_eq!(browser.status, 200);
+    assert!(
+        browser.header("content-type").unwrap().starts_with("text/html"),
+        "browsers get the page"
+    );
+    let page = browser.body_string();
+    assert!(page.starts_with("<!DOCTYPE html>"));
+    assert!(page.contains("<h2>Product</h2>"), "sections serialize");
+    assert!(page.contains("not shown — "), "the gap is stated in the page");
+    assert!(page.contains("Coverage"), "the coverage footer serializes");
+    assert!(!page.contains("<script"), "the page carries no script");
+    // Determinism: the same request returns the same bytes (fixed `at`).
+    let again = unidpp_projector::http::request(
+        "GET",
+        &Url::parse(&render_url(&query)).unwrap(),
+        &[("accept".to_string(), "text/html".to_string())],
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.body_string(), page, "fixed `at` → identical bytes");
+
+    // An API client (`*/*`, no format parameter) → JSON, unchanged.
+    let api = json_request("GET", &render_url(&query), None, None, TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(api.status, 200);
+    assert!(api.header("content-type").unwrap().starts_with("application/json"));
+    let doc: Value = serde_json::from_str(&api.body_string()).unwrap();
+    assert!(doc.pointer("/sections").is_some(), "the JSON render is unchanged");
+
+    // The explicit parameter outranks the header both ways.
+    let forced_json = unidpp_projector::http::request(
+        "GET",
+        &Url::parse(&render_url(&format!("{query}&format=json"))).unwrap(),
+        &[("accept".to_string(), "text/html".to_string())],
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(forced_json.header("content-type").unwrap().starts_with("application/json"));
+    let forced_html = json_request(
+        "GET",
+        &render_url(&format!("{query}&format=html")),
+        None,
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(forced_html.header("content-type").unwrap().starts_with("text/html"));
+
+    // An unknown format is refused with a stated reason.
+    let bad = json_request(
+        "GET",
+        &render_url(&format!("{query}&format=xml")),
+        None,
+        None,
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(bad.status, 400);
+    assert!(bad.body_string().contains("unknown `format`"));
+
+    projector.stop().await;
+}
