@@ -67,9 +67,11 @@
 //!   passport (deterministic, fixed timestamps), the EU/JP lens
 //!   manifests, the built-in battery decision-rule `.prml` package (a
 //!   guard band with w = U; efficiency class bands), the consumer
-//!   presentation lens, and the battery-pack roll-up corpus (a pack
-//!   system over three pack children + the EU-class-to-JP-star
-//!   mapping).
+//!   presentation lens, the CN regulatory protocol lens (TODO.impl
+//!   224: the MobileQR ProtocolChecks pattern — national conformity
+//!   regimes as named, labelled data points), and the battery-pack
+//!   roll-up corpus (a pack system over three pack children + the
+//!   EU-class-to-JP-star mapping).
 //!
 //! Division of labour (MECE): the registry owns item lifecycle
 //! (profiles, units, transform packages — versioned supersession,
