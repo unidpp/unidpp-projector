@@ -1,0 +1,154 @@
+components: {}
+info:
+  description: 'The presentation service: it folds the governed twin as of an instant under a profile''s lens, renders the consumer presentation (JSON, HTML, speakable text — one computation, three wire formats), and seals roll-ups where a sealer is configured. Lens manifests resolve registry first, fixtures otherwise, with the source stated.'
+  license:
+    identifier: Apache-2.0
+    name: Apache-2.0
+  title: UniDPP projector
+  version: 0.1.0
+  x-unidpp-env-keys:
+  - UNIDPP_PROJECTOR_BIND
+  - UNIDPP_REGISTRY_URL
+  - UNIDPP_PROJECTOR_REGISTRY_TOKEN
+  - UNIDPP_PROJECTOR_PASSPORTS_DIR
+  - UNIDPP_PROJECTOR_PRIMMEL_DIR
+  - UNIDPP_PROJECTOR_ROLLUP_SEED
+  - UNIDPP_PROJECTOR_ROLLUP_ATTESTER
+openapi: 3.1.0
+paths:
+  /:
+    get:
+      operationId: discovery
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The discovery document: the view and render query forms, the as-of semantics, the coverage honesty and the render metadata shape'
+      summary: Serve the discovery document.
+      tags:
+      - projection
+  /healthz:
+    get:
+      operationId: healthz
+      responses:
+        '200':
+          description: The service is serving
+      summary: Liveness probe.
+      tags:
+      - projection
+  /render:
+    get:
+      description: |-
+        One presentation computation, three wire formats (TODO.impl 224):
+        JSON by default; `Accept: text/html` or `text/plain` (or an
+        explicit `format` parameter, which outranks the header) serves the
+        same render document as a standalone HTML page or as speakable
+        text (the TTS substrate) — the consumer surfaces a scanned code
+        resolves to.
+        The consumer presentation: the passport's data points arranged per
+        the lens's presentation binding, localized and formatted, with
+        links to the authoritative sources. One presentation computation,
+        three wire formats — JSON by default; `Accept: text/html` or
+        `text/plain` (or an explicit `format` parameter, which outranks
+        the header) serves the same render document as a standalone HTML
+        page or as speakable text.
+      operationId: render_handler
+      parameters:
+      - description: The passport identifier
+        in: query
+        name: passport
+        required: true
+        schema:
+          type: string
+      - description: The profile whose presentation binding is applied
+        in: query
+        name: profile
+        required: true
+        schema:
+          type: string
+      - description: The requested language tag (a fallback is served when the requested language has no label)
+        in: query
+        name: lang
+        required: true
+        schema:
+          type: string
+      - description: An RFC 3339 instant
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      - description: '`html`, `text` or `json`; outranks the `Accept` header'
+        in: query
+        name: format
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The render, as-of stamped
+        '400':
+          description: A missing required query parameter, or an unknown `format`
+        '404':
+          description: No such passport
+      summary: |-
+        GET /render — the consumer presentation (TODO.impl 54): the
+        passport's data points arranged per the lens's presentation
+        binding, localized, formatted, with links to the authoritative
+        sources and the same coverage honesty as the view.
+      tags:
+      - projection
+  /view:
+    get:
+      operationId: view
+      parameters:
+      - description: The passport identifier
+        in: query
+        name: passport
+        required: true
+        schema:
+          type: string
+      - description: The profile whose lens is applied
+        in: query
+        name: profile
+        required: true
+        schema:
+          type: string
+      - description: The requesting role (the lens may gate data points on it)
+        in: query
+        name: actor
+        required: true
+        schema:
+          type: string
+      - description: An RFC 3339 instant; the twin is folded as of that instant
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The view, as-of stamped, with the coverage and provenance metadata
+        '400':
+          description: A missing required query parameter
+        '404':
+          description: No such passport
+      summary: |-
+        GET /view — the projection.
+        The twin-fold view of a passport under a lens, as of an instant:
+        the profile's lens manifest resolved (registry first, fixtures
+        otherwise), the data points presented with the same coverage
+        honesty the render carries, and the roll-up where a sealer is
+        configured.
+      tags:
+      - projection
+tags:
+- description: The twin-fold view and the consumer render
+  name: projection

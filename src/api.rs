@@ -43,6 +43,8 @@ use axum::routing::get;
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use unidpp_cli::passport::Passport;
 use unidpp_model::{Resolution, Timestamp};
 
@@ -104,9 +106,29 @@ impl Default for Config {
 
 impl Config {
     /// Resolve configuration from environment variables.
+    /// The environment variables this service consumes. This is the
+    /// deployment contract: unidpp-config renders exactly these names
+    /// for the projector, and the contract document carries them as
+    /// `x-unidpp-env-keys`.
+    pub const ENV_KEYS: &'static [&'static str] = &[
+        "UNIDPP_PROJECTOR_BIND",
+        "UNIDPP_REGISTRY_URL",
+        "UNIDPP_PROJECTOR_REGISTRY_TOKEN",
+        "UNIDPP_PROJECTOR_PASSPORTS_DIR",
+        "UNIDPP_PROJECTOR_PRIMMEL_DIR",
+        "UNIDPP_PROJECTOR_ROLLUP_SEED",
+        "UNIDPP_PROJECTOR_ROLLUP_ATTESTER",
+    ];
+
     pub fn from_env() -> Config {
         let mut config = Config::default();
-        if let Ok(bind) = std::env::var("UNIDPP_PROJECTOR_BIND") {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        for key in Self::ENV_KEYS {
+            if let Ok(value) = std::env::var(key) {
+                vars.insert(*key, value);
+            }
+        }
+        if let Some(bind) = vars.get("UNIDPP_PROJECTOR_BIND") {
             match bind.parse() {
                 Ok(addr) => config.bind = addr,
                 Err(_) => {
@@ -114,22 +136,22 @@ impl Config {
                 }
             }
         }
-        if let Ok(url) = std::env::var("UNIDPP_REGISTRY_URL") {
+        if let Some(url) = vars.get("UNIDPP_REGISTRY_URL") {
             if !url.is_empty() {
-                config.registry_url = Some(url);
+                config.registry_url = Some(url.clone());
             }
         }
-        if let Ok(token) = std::env::var("UNIDPP_PROJECTOR_REGISTRY_TOKEN") {
+        if let Some(token) = vars.get("UNIDPP_PROJECTOR_REGISTRY_TOKEN") {
             if !token.is_empty() {
-                config.registry_token = Some(token);
+                config.registry_token = Some(token.clone());
             }
         }
-        if let Ok(dir) = std::env::var("UNIDPP_PROJECTOR_PASSPORTS_DIR") {
+        if let Some(dir) = vars.get("UNIDPP_PROJECTOR_PASSPORTS_DIR") {
             if !dir.is_empty() {
                 config.passports_dir = Some(PathBuf::from(dir));
             }
         }
-        if let Ok(dir) = std::env::var("UNIDPP_PROJECTOR_PRIMMEL_DIR") {
+        if let Some(dir) = vars.get("UNIDPP_PROJECTOR_PRIMMEL_DIR") {
             if !dir.is_empty() {
                 config.primmel_dir = Some(PathBuf::from(dir));
             }
@@ -141,9 +163,9 @@ impl Config {
                 &mut config.rollup_attester,
             ),
         ] {
-            if let Ok(value) = std::env::var(var) {
+            if let Some(value) = vars.get(var) {
                 if !value.is_empty() {
-                    *slot = Some(value);
+                    *slot = Some(value.clone());
                 }
             }
         }
@@ -191,12 +213,70 @@ impl AppState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interface contract
+// ---------------------------------------------------------------------------
+
+/// The routed paths, declared once. The router routes by these
+/// constants, the contract document is tested against them, and no
+/// route may be declared with a raw literal (the gates enforce both).
+pub mod paths {
+    pub const ROOT: &str = "/";
+    pub const HEALTHZ: &str = "/healthz";
+    pub const VIEW: &str = "/view";
+    pub const RENDER: &str = "/render";
+    /// The contract document itself (not an operation of the API).
+    pub const CONTRACT_YAML: &str = "/openapi.yaml";
+}
+
+/// The OpenAPI model: one declaration per handler (`#[utoipa::path]`),
+/// from which the served contract, the golden file and Swagger UI all
+/// derive.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "UniDPP projector",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "The presentation service: it folds the governed twin as of an instant under a profile's lens, renders the consumer presentation (JSON, HTML, speakable text — one computation, three wire formats), and seals roll-ups where a sealer is configured. Lens manifests resolve registry first, fixtures otherwise, with the source stated.",
+        license(name = "Apache-2.0", identifier = "Apache-2.0"),
+    ),
+    paths(discovery, healthz, view, render_handler),
+    tags(
+        (name = "projection", description = "The twin-fold view and the consumer render"),
+    )
+)]
+struct ApiDoc;
+
+/// The contract document: the OpenAPI model plus the deployment keys
+/// (`x-unidpp-env-keys`). Served at `/openapi.yaml` and committed as
+/// the golden `openapi.yaml`.
+pub fn contract_yaml() -> String {
+    let mut doc = serde_json::to_value(ApiDoc::openapi()).expect("contract serializes");
+    doc["info"]["x-unidpp-env-keys"] = json!(Config::ENV_KEYS);
+    serde_yaml::to_string(&doc).expect("contract renders as YAML")
+}
+
+async fn openapi_yaml() -> Result<Response, Response> {
+    let mut response = stamped(
+        StatusCode::OK,
+        &serde_json::from_str::<Value>(&contract_yaml()).expect("contract parses back"),
+        Timestamp::now(),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/yaml"),
+    );
+    Ok(response)
+}
+
 pub fn router(app: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(discovery))
-        .route("/healthz", get(healthz))
-        .route("/view", get(view))
-        .route("/render", get(render_handler))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route(paths::ROOT, get(discovery))
+        .route(paths::HEALTHZ, get(healthz))
+        .route(paths::VIEW, get(view))
+        .route(paths::RENDER, get(render_handler))
+        .route(paths::CONTRACT_YAML, get(openapi_yaml))
         .with_state(app)
 }
 
@@ -261,6 +341,15 @@ impl TestServer {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Serve the discovery document.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "projection",
+    responses(
+        (status = 200, description = "The discovery document: the view and render query forms, the as-of semantics, the coverage honesty and the render metadata shape", body = Value, content_type = "application/json"),
+    )
+)]
 async fn discovery() -> Result<Response, Response> {
     let doc = json!({
         "service": "unidpp-projector",
@@ -301,6 +390,15 @@ async fn discovery() -> Result<Response, Response> {
     Ok(stamped(StatusCode::OK, &doc, Timestamp::now()))
 }
 
+/// Liveness probe.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "projection",
+    responses(
+        (status = 200, description = "The service is serving"),
+    )
+)]
 async fn healthz() -> Result<Response, Response> {
     Ok(build_response(
         StatusCode::OK,
@@ -621,6 +719,27 @@ fn load_children(dir: Option<&Path>, subject: &Passport, at: Timestamp) -> Child
 }
 
 /// GET /view — the projection.
+/// The twin-fold view of a passport under a lens, as of an instant:
+/// the profile's lens manifest resolved (registry first, fixtures
+/// otherwise), the data points presented with the same coverage
+/// honesty the render carries, and the roll-up where a sealer is
+/// configured.
+#[utoipa::path(
+    get,
+    path = "/view",
+    tag = "projection",
+    params(
+        ("passport" = String, Query, description = "The passport identifier"),
+        ("profile" = String, Query, description = "The profile whose lens is applied"),
+        ("actor" = String, Query, description = "The requesting role (the lens may gate data points on it)"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; the twin is folded as of that instant"),
+    ),
+    responses(
+        (status = 200, description = "The view, as-of stamped, with the coverage and provenance metadata", body = Value, content_type = "application/json"),
+        (status = 400, description = "A missing required query parameter"),
+        (status = 404, description = "No such passport"),
+    )
+)]
 async fn view(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -728,6 +847,30 @@ fn parse_render_query(params: &HashMap<String, String>) -> Result<RenderQuery, R
 /// same render document as a standalone HTML page or as speakable
 /// text (the TTS substrate) — the consumer surfaces a scanned code
 /// resolves to.
+/// The consumer presentation: the passport's data points arranged per
+/// the lens's presentation binding, localized and formatted, with
+/// links to the authoritative sources. One presentation computation,
+/// three wire formats — JSON by default; `Accept: text/html` or
+/// `text/plain` (or an explicit `format` parameter, which outranks
+/// the header) serves the same render document as a standalone HTML
+/// page or as speakable text.
+#[utoipa::path(
+    get,
+    path = "/render",
+    tag = "projection",
+    params(
+        ("passport" = String, Query, description = "The passport identifier"),
+        ("profile" = String, Query, description = "The profile whose presentation binding is applied"),
+        ("lang" = String, Query, description = "The requested language tag (a fallback is served when the requested language has no label)"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant"),
+        ("format" = Option<String>, Query, description = "`html`, `text` or `json`; outranks the `Accept` header"),
+    ),
+    responses(
+        (status = 200, description = "The render, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 400, description = "A missing required query parameter, or an unknown `format`"),
+        (status = 404, description = "No such passport"),
+    )
+)]
 async fn render_handler(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1352,5 +1495,133 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("battery.prml"));
         let _ = std::fs::remove_file(dir.join("broken.prml"));
         let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract gates
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod contract_gates {
+    use super::*;
+    use crate::http::request;
+    use crate::http::Url;
+    use std::time::Duration;
+
+    const VERBS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
+
+    /// The contract paths with their documented methods.
+    fn documented() -> std::collections::BTreeMap<String, Vec<String>> {
+        let doc: Value = serde_yaml::from_str(&contract_yaml()).expect("contract parses");
+        doc["paths"]
+            .as_object()
+            .expect("paths object")
+            .iter()
+            .map(|(path, item)| {
+                let methods = VERBS
+                    .iter()
+                    .filter(|v| item.get(*v).is_some())
+                    .map(|v| v.to_string())
+                    .collect();
+                (path.clone(), methods)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_golden_matches_the_committed_contract() {
+        assert_eq!(contract_yaml(), include_str!("../openapi.yaml"));
+    }
+
+    #[test]
+    #[ignore = "regenerates openapi.yaml after a route change: cargo test contract_gates -- --ignored export"]
+    fn export_golden() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"),
+            contract_yaml(),
+        )
+        .expect("golden written");
+    }
+
+    /// Every path the router serves (the contract route itself
+    /// carries no operation).
+    fn routed_paths() -> Vec<&'static str> {
+        vec![paths::ROOT, paths::HEALTHZ, paths::VIEW, paths::RENDER]
+    }
+
+    #[test]
+    fn every_routed_path_is_documented() {
+        let doc = documented();
+        for path in routed_paths() {
+            assert!(doc.contains_key(path), "routed but undocumented: {path}");
+        }
+    }
+
+    #[test]
+    fn every_documented_path_is_routed() {
+        let routed: std::collections::BTreeSet<String> =
+            routed_paths().into_iter().map(str::to_string).collect();
+        for path in documented().keys() {
+            assert!(routed.contains(path), "documented but not routed: {path}");
+        }
+    }
+
+    #[test]
+    fn routes_are_declared_by_constant_not_literal() {
+        let flat: String = include_str!("api.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut idx = 0;
+        while let Some(pos) = flat[idx..].find(".route(") {
+            let abs = idx + pos;
+            if abs > 0 && flat.as_bytes()[abs - 1] == b'"' {
+                idx = abs + 7;
+                continue;
+            }
+            let after = flat[abs + 7..].trim_start();
+            assert!(
+                after.starts_with("paths::"),
+                "route paths come from the paths:: constants: `{}`",
+                &flat[abs..(abs + 60).min(flat.len())]
+            );
+            idx = abs + 7;
+        }
+    }
+
+    /// The behavioral half: every documented operation answers
+    /// anything but 405, and every undocumented method on a documented
+    /// path answers 405 — on the live router.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_router_serves_the_contract_exactly() {
+        let ts = TestServer::spawn(Config::default())
+            .await
+            .expect("test server");
+        for (path, methods) in documented() {
+            for verb in VERBS {
+                let resp = request(
+                    &verb.to_uppercase(),
+                    &Url::parse(&format!("{}{path}", ts.base_url)).expect("probe url"),
+                    &[],
+                    if verb == "get" { None } else { Some(b"{}".as_slice()) },
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("probe answered");
+                if methods.contains(&verb.to_string()) {
+                    assert_ne!(
+                        resp.status, 405,
+                        "{verb} {path}: the contract says routed, the router says otherwise"
+                    );
+                } else {
+                    assert_eq!(
+                        resp.status, 405,
+                        "{verb} {path}: served but not in the contract"
+                    );
+                }
+            }
+        }
+        ts.stop().await;
     }
 }
