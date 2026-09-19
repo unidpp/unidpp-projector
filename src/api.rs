@@ -257,15 +257,16 @@ pub fn contract_yaml() -> String {
 }
 
 async fn openapi_yaml() -> Result<Response, Response> {
-    let mut response = stamped(
-        StatusCode::OK,
-        &serde_json::from_str::<Value>(&contract_yaml()).expect("contract parses back"),
-        Timestamp::now(),
-    );
-    response.headers_mut().insert(
+    let mut response = Response::new(axum::body::Body::from(contract_yaml()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/yaml"),
     );
+    if let Ok(as_of) = axum::http::HeaderValue::from_str(&Timestamp::now().to_string()) {
+        headers.insert("x-as-of", as_of);
+    }
     Ok(response)
 }
 
