@@ -43,10 +43,10 @@ use axum::routing::get;
 use axum::Router;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 use unidpp_cli::passport::Passport;
 use unidpp_model::{Resolution, Timestamp};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::aggregate::{ChildDocuments, RollupSealer};
 use crate::codelist::{CodeListMapping, MappingSet};
@@ -878,10 +878,8 @@ async fn render_handler(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let query = parse_render_query(&params)?;
-    let format = crate::html::requested_format(
-        &params,
-        headers.get("accept").and_then(|v| v.to_str().ok()),
-    );
+    let format =
+        crate::html::requested_format(&params, headers.get("accept").and_then(|v| v.to_str().ok()));
     if let crate::html::Format::Invalid(other) = &format {
         return Err(bad_request(format!(
             "unknown `format` `{other}` — `html`, `text` or `json`"
@@ -931,14 +929,10 @@ async fn render_handler(
         block.insert("source".into(), json!(passport_source));
     }
     if let Some((content_type, body)) = match &format {
-        crate::html::Format::Html => Some((
-            "text/html; charset=utf-8",
-            crate::html::document(&doc),
-        )),
-        crate::html::Format::Text => Some((
-            "text/plain; charset=utf-8",
-            crate::html::text(&doc),
-        )),
+        crate::html::Format::Html => {
+            Some(("text/html; charset=utf-8", crate::html::document(&doc)))
+        }
+        crate::html::Format::Text => Some(("text/plain; charset=utf-8", crate::html::text(&doc))),
         _ => None,
     } {
         return Ok(build_response(
@@ -1605,7 +1599,11 @@ mod contract_gates {
                     &verb.to_uppercase(),
                     &Url::parse(&format!("{}{path}", ts.base_url)).expect("probe url"),
                     &[],
-                    if verb == "get" { None } else { Some(b"{}".as_slice()) },
+                    if verb == "get" {
+                        None
+                    } else {
+                        Some(b"{}".as_slice())
+                    },
                     Duration::from_secs(5),
                 )
                 .await

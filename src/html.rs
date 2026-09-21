@@ -79,8 +79,12 @@ pub fn document(render: &Value) -> String {
     }
 
     // --- coverage footer: the same honesty as the JSON -----------------
-    let required = render.pointer("/coverage/elements_required").and_then(Value::as_u64);
-    let present = render.pointer("/coverage/elements_present").and_then(Value::as_u64);
+    let required = render
+        .pointer("/coverage/elements_required")
+        .and_then(Value::as_u64);
+    let present = render
+        .pointer("/coverage/elements_present")
+        .and_then(Value::as_u64);
     let complete = render
         .pointer("/coverage/complete")
         .and_then(Value::as_bool)
@@ -92,7 +96,10 @@ pub fn document(render: &Value) -> String {
             if complete { "complete" } else { "incomplete" }
         )));
         out.push_str("</p>\n");
-        if let Some(missing) = render.pointer("/coverage/missing").and_then(Value::as_array) {
+        if let Some(missing) = render
+            .pointer("/coverage/missing")
+            .and_then(Value::as_array)
+        {
             if !missing.is_empty() {
                 out.push_str("<ul class=\"gaps\">\n");
                 for m in missing {
@@ -208,8 +215,12 @@ pub fn text(render: &Value) -> String {
             "\nThe most recent information on this page was recorded on {newest}.\n"
         ));
     }
-    let required = render.pointer("/coverage/elements_required").and_then(Value::as_u64);
-    let present = render.pointer("/coverage/elements_present").and_then(Value::as_u64);
+    let required = render
+        .pointer("/coverage/elements_required")
+        .and_then(Value::as_u64);
+    let present = render
+        .pointer("/coverage/elements_present")
+        .and_then(Value::as_u64);
     let complete = render
         .pointer("/coverage/complete")
         .and_then(Value::as_bool)
@@ -356,7 +367,10 @@ mod tests {
         assert!(page.contains("4 of 5"), "the coverage counts render");
         // Language and identity anchor the page.
         assert!(page.contains(r#"<html lang="en">"#));
-        assert!(page.contains("urn:iso:std:iso-iec:15459"), "the product id is the title");
+        assert!(
+            page.contains("urn:iso:std:iso-iec:15459"),
+            "the product id is the title"
+        );
     }
 
     #[test]
@@ -415,7 +429,9 @@ mod tests {
         )));
         assert!(!accept_prefers_html(Some("*/*")));
         assert!(!accept_prefers_html(Some("application/json")));
-        assert!(!accept_prefers_html(Some("application/json, text/html;q=0.5")));
+        assert!(!accept_prefers_html(Some(
+            "application/json, text/html;q=0.5"
+        )));
         assert!(!accept_prefers_html(None));
         // The explicit parameter outranks the header.
         let mut params = HashMap::new();

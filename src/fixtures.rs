@@ -371,8 +371,7 @@ pub fn demo_passport() -> Passport {
                 field: f::CN_PROTOCOL_LICENSE.into(),
                 prior_value: String::new(),
                 new_value: "false".into(),
-                reason: "industrial product production licence not required for this class"
-                    .into(),
+                reason: "industrial product production licence not required for this class".into(),
             },
             TrustMarker::SelfDeclared,
         ),
@@ -813,9 +812,24 @@ pub fn cn_protocol_lens() -> LensManifest {
                 id: "regulatory".to_string(),
                 labels: labels(&[("zh", "监管协议核查"), ("en", "Regulatory protocol checks")]),
                 elements: vec![
-                    presented(CN_3C_ELEMENT, &[("zh", "强制性产品认证（CCC）"), ("en", "CCC certification protocol")]),
-                    presented(CN_PRODUCER_ELEMENT, &[("zh", "生产者法规"), ("en", "Producer regulation protocol")]),
-                    presented(CN_LICENSE_ELEMENT, &[("zh", "工业产品生产许可证"), ("en", "Industrial product production licence")]),
+                    presented(
+                        CN_3C_ELEMENT,
+                        &[
+                            ("zh", "强制性产品认证（CCC）"),
+                            ("en", "CCC certification protocol"),
+                        ],
+                    ),
+                    presented(
+                        CN_PRODUCER_ELEMENT,
+                        &[("zh", "生产者法规"), ("en", "Producer regulation protocol")],
+                    ),
+                    presented(
+                        CN_LICENSE_ELEMENT,
+                        &[
+                            ("zh", "工业产品生产许可证"),
+                            ("en", "Industrial product production licence"),
+                        ],
+                    ),
                 ],
             }],
         }),
@@ -1395,7 +1409,10 @@ mod tests {
         assert_eq!(items[2]["label"], json!("工业产品生产许可证"));
         assert_eq!(items[2]["formatted"], json!("false"));
         assert_eq!(doc.pointer("/coverage/complete").unwrap(), &json!(true));
-        assert_eq!(doc.pointer("/coverage/elements_present").unwrap(), &json!(3));
+        assert_eq!(
+            doc.pointer("/coverage/elements_present").unwrap(),
+            &json!(3)
+        );
         // Every serialization carries the regime: the HTML page names
         // the section, the text form speaks it.
         let page = crate::html::document(&doc);

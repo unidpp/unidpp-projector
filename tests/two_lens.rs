@@ -817,8 +817,7 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
         Url::encode_query_component(fixtures::CONSUMER_LENS_ID),
         Url::encode_query_component(DEMO_AT)
     );
-    let render_url =
-        |q: &str| format!("{base}/render{q}");
+    let render_url = |q: &str| format!("{base}/render{q}");
 
     // A browser's Accept (text/html first) → the HTML serialization.
     let browser = unidpp_projector::http::request(
@@ -835,13 +834,19 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
     .expect("browser render request completes");
     assert_eq!(browser.status, 200);
     assert!(
-        browser.header("content-type").unwrap().starts_with("text/html"),
+        browser
+            .header("content-type")
+            .unwrap()
+            .starts_with("text/html"),
         "browsers get the page"
     );
     let page = browser.body_string();
     assert!(page.starts_with("<!DOCTYPE html>"));
     assert!(page.contains("<h2>Product</h2>"), "sections serialize");
-    assert!(page.contains("not shown — "), "the gap is stated in the page");
+    assert!(
+        page.contains("not shown — "),
+        "the gap is stated in the page"
+    );
     assert!(page.contains("Coverage"), "the coverage footer serializes");
     assert!(!page.contains("<script"), "the page carries no script");
     // Determinism: the same request returns the same bytes (fixed `at`).
@@ -861,9 +866,15 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
         .await
         .unwrap();
     assert_eq!(api.status, 200);
-    assert!(api.header("content-type").unwrap().starts_with("application/json"));
+    assert!(api
+        .header("content-type")
+        .unwrap()
+        .starts_with("application/json"));
     let doc: Value = serde_json::from_str(&api.body_string()).unwrap();
-    assert!(doc.pointer("/sections").is_some(), "the JSON render is unchanged");
+    assert!(
+        doc.pointer("/sections").is_some(),
+        "the JSON render is unchanged"
+    );
 
     // The explicit parameter outranks the header both ways.
     let forced_json = unidpp_projector::http::request(
@@ -875,7 +886,10 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
     )
     .await
     .unwrap();
-    assert!(forced_json.header("content-type").unwrap().starts_with("application/json"));
+    assert!(forced_json
+        .header("content-type")
+        .unwrap()
+        .starts_with("application/json"));
     let forced_html = json_request(
         "GET",
         &render_url(&format!("{query}&format=html")),
@@ -885,7 +899,10 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
     )
     .await
     .unwrap();
-    assert!(forced_html.header("content-type").unwrap().starts_with("text/html"));
+    assert!(forced_html
+        .header("content-type")
+        .unwrap()
+        .starts_with("text/html"));
 
     // The text form: the same render as speakable text (the TTS
     // substrate), honest about its gap, negotiable by Accept too.
@@ -899,9 +916,15 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
     .await
     .unwrap();
     assert_eq!(spoken.status, 200);
-    assert!(spoken.header("content-type").unwrap().starts_with("text/plain"));
+    assert!(spoken
+        .header("content-type")
+        .unwrap()
+        .starts_with("text/plain"));
     let spoken_body = spoken.body_string();
-    assert!(spoken_body.contains("Battery capacity: "), "labels serialize");
+    assert!(
+        spoken_body.contains("Battery capacity: "),
+        "labels serialize"
+    );
     assert!(spoken_body.contains("not shown — "), "the gap is spoken");
     assert!(!spoken_body.contains('<'), "no markup");
     let via_accept = unidpp_projector::http::request(
@@ -913,7 +936,10 @@ async fn the_render_serves_html_to_browsers_and_json_to_clients() {
     )
     .await
     .unwrap();
-    assert!(via_accept.header("content-type").unwrap().starts_with("text/plain"));
+    assert!(via_accept
+        .header("content-type")
+        .unwrap()
+        .starts_with("text/plain"));
     assert_eq!(via_accept.body_string(), spoken_body);
 
     // An unknown format is refused with a stated reason.
