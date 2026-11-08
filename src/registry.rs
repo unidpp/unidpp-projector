@@ -151,9 +151,110 @@ impl RegistryClient {
     }
 }
 
+/// The transport boundary of the projector→registry edge (REARCH
+/// R7): exactly the point-in-time item read, nothing more. The
+/// default implementation is the loopback HTTP client
+/// ([`RegistryClient`]); the one deployment injects an in-process
+/// bridge over the registry module's own router instead, and the
+/// edge stops touching sockets.
+pub trait RegistryViews: Send + Sync {
+    fn fetch_item<'a>(
+        &'a self,
+        subregister: &'a str,
+        item_id: &'a str,
+        at: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FetchOutcome, String>> + Send + 'a>,
+    >;
+}
+
+impl RegistryViews for RegistryClient {
+    fn fetch_item<'a>(
+        &'a self,
+        subregister: &'a str,
+        item_id: &'a str,
+        at: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FetchOutcome, String>> + Send + 'a>,
+    > {
+        Box::pin(async move { RegistryClient::fetch_item(self, subregister, item_id, at).await })
+    }
+}
+
+/// The embedder's bridge: the registry module's own axum router
+/// served through tower — the read keeps the registry's own
+/// semantics (2xx item, 404 missing, fixtures degradation decided by
+/// the caller's configuration), by construction.
+pub struct InProcessRegistry {
+    pub router: axum::Router,
+}
+
+impl RegistryViews for InProcessRegistry {
+    fn fetch_item<'a>(
+        &'a self,
+        subregister: &'a str,
+        item_id: &'a str,
+        at: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FetchOutcome, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut path = format!("/{}/{}", subregister, Url::encode_path_segment(item_id));
+            if let Some(at) = at.as_deref() {
+                path.push_str("?at=");
+                path.push_str(&Url::encode_query_component(at));
+            }
+            let uri: axum::http::Uri = path
+                .parse()
+                .map_err(|e| format!("bad registry read path `{path}`: {e}"))?;
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .map_err(|e| format!("registry read request: {e}"))?;
+            use tower::util::ServiceExt;
+            let resp = ServiceExt::oneshot(&mut self.router.clone(), request)
+                .await
+                .map_err(|e| format!("registry not reachable: {e}"))?;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+                .await
+                .map_err(|e| format!("registry read body: {e}"))?;
+            let text = String::from_utf8_lossy(&body).to_string();
+            match status {
+                s if s.is_success() => {
+                    let item: Value = serde_json::from_str(&text)
+                        .map_err(|e| format!("registry item `{item_id}` is not valid JSON: {e}"))?;
+                    Ok(FetchOutcome::Registry(item))
+                }
+                axum::http::StatusCode::NOT_FOUND => Ok(FetchOutcome::Missing),
+                other => Err(format!(
+                    "registry rejected the read of `{item_id}` ({}): {}",
+                    other, text
+                )),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_bridge_parses_like_the_client() {
+        // The InProcess bridge and the HTTP client share the outcome
+        // vocabulary: a 404 from the mounted service is `Missing`
+        // (not an error), exactly as the loopback client reports it —
+        // the parity the server-level tests assert end to end.
+        let out = InProcessRegistry {
+            router: axum::Router::new(),
+        }
+        .fetch_item(subregister::PROFILES, "x", None)
+        .await
+        .unwrap();
+        assert_eq!(out, FetchOutcome::Missing);
+    }
 
     #[test]
     fn outcome_tokens_and_fallback() {

@@ -29,6 +29,7 @@ unidpp-transform = { path = "../unidpp-core/crates/transform" }
 unidpp-cli = { path = "../unidpp-cli" }
 unidpp-signatif = { path = "../unidpp-signatif" }
 axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

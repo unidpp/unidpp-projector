@@ -177,7 +177,10 @@ impl Config {
 /// beyond its optional roll-up sealing key).
 pub struct AppState {
     pub config: Config,
-    pub registry: RegistryClient,
+    /// The registry read transport (REARCH R7): the loopback HTTP
+    /// client by default; the one deployment injects an in-process
+    /// bridge over the registry module's own router.
+    pub registry: std::sync::Arc<dyn crate::registry::RegistryViews>,
     /// The roll-up sealer derived from the configured seed (off when
     /// no key is configured, or the configuration is incomplete — the
     /// refusal is logged, never half-armed).
@@ -186,8 +189,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> AppState {
-        let registry =
-            RegistryClient::new(config.registry_url.clone(), config.registry_token.clone());
+        let registry: std::sync::Arc<dyn crate::registry::RegistryViews> = std::sync::Arc::new(
+            RegistryClient::new(config.registry_url.clone(), config.registry_token.clone()),
+        );
         let sealer = match (&config.rollup_seed, &config.rollup_attester) {
             (Some(seed), Some(attester)) => match RollupSealer::seeded(seed, attester) {
                 Ok(sealer) => sealer,
@@ -1059,7 +1063,17 @@ fn internal_error(msg: &str) -> Response {
 impl AppState {
     /// The configured registry base (mode dispatch).
     fn registry_base(&self) -> Option<&str> {
-        self.registry.base()
+        self.config.registry_url.as_deref()
+    }
+
+    /// Swap the registry read transport (REARCH R7): the one
+    /// deployment injects its in-process bridge here.
+    pub fn with_registry_bridge(
+        mut self,
+        bridge: std::sync::Arc<dyn crate::registry::RegistryViews>,
+    ) -> AppState {
+        self.registry = bridge;
+        self
     }
 }
 

@@ -110,6 +110,6 @@ pub use lens::{
 };
 pub use primmel::{PackageSet, PrimmelPackage, PrimmelRule};
 pub use project::{project, MissingReason, ProfileSource, RegisteredUnit, ViewError};
-pub use registry::{FetchOutcome, RegistryClient};
+pub use registry::{FetchOutcome, InProcessRegistry, RegistryClient, RegistryViews};
 pub use render::render;
 pub use twin::{FactOrigin, SourcedFact, TwinState};
